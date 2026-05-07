@@ -284,7 +284,65 @@ std::shared_ptr<VROShaderProgram> VROShaderFactory::buildShader(VROShaderCapabil
     // Custom material modifiers. These are added to the back of the modifiers list
     // so that they can build off the standard modifiers.
     modifiers.insert(modifiers.end(), modifiers_in.begin(), modifiers_in.end());
-    
+
+    // Extract required samplers from custom modifiers.
+    // Modifiers can specify required samplers using a special comment format in their body:
+    //   "// @sampler ar_depth_texture"
+    // This adds the sampler to the samplers list for proper texture binding.
+    // Note: The modifier must ALSO declare the uniform (e.g., "uniform sampler2D ar_depth_texture;")
+    // for the sampler to be usable in the shader. The @sampler marker only handles binding.
+    for (const std::shared_ptr<VROShaderModifier> &modifier : modifiers_in) {
+        std::string bodySource = modifier->getBodySource();
+        const std::string marker = "// @sampler ";
+        size_t pos = 0;
+        while ((pos = bodySource.find(marker, pos)) != std::string::npos) {
+            pos += marker.length();
+            // Find end of sampler name (newline or end of string)
+            size_t end = bodySource.find('\n', pos);
+            if (end == std::string::npos) {
+                end = bodySource.length();
+            }
+            std::string samplerName = bodySource.substr(pos, end - pos);
+            // Trim whitespace
+            size_t start = samplerName.find_first_not_of(" \t");
+            size_t last = samplerName.find_last_not_of(" \t\r");
+            if (start != std::string::npos && last != std::string::npos) {
+                samplerName = samplerName.substr(start, last - start + 1);
+            }
+            // Add to samplers list if not already present
+            if (!samplerName.empty()) {
+                bool found = false;
+                for (const std::string &s : samplers) {
+                    if (s == samplerName) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    samplers.push_back(samplerName);
+                }
+            }
+        }
+    }
+
+    // AR Occlusion - add depth-based occlusion for AR when enabled
+    // This must come after shadow modifiers but before tone mapping
+    // Skip if a custom modifier already declares ar_depth_texture (e.g., camera background's depth debug modifier)
+    // to avoid duplicate uniform declarations
+    bool hasDepthTextureModifier = false;
+    for (const std::shared_ptr<VROShaderModifier> &modifier : modifiers_in) {
+        if (modifier->getBodySource().find("ar_depth_texture") != std::string::npos ||
+            modifier->getBodySource().find("ar_occlusion_depth_texture") != std::string::npos) {
+            hasDepthTextureModifier = true;
+            break;
+        }
+    }
+
+    if (lightingCapabilities.arOcclusion && !hasDepthTextureModifier) {
+        samplers.push_back("ar_occlusion_depth_texture");
+        modifiers.push_back(createOcclusionMaskModifier());
+    }
+
     // All shaders use these three base attributes. Add additional attributes from the
     // modifiers.
     int attributes = (int)(VROShaderMask::Tex) | (int)(VROShaderMask::Norm) | (int)(VROShaderMask::Tangent);
@@ -298,7 +356,7 @@ std::shared_ptr<VROShaderProgram> VROShaderFactory::buildShader(VROShaderCapabil
     if (lightingCapabilities.hdr) {
         modifiers.push_back(createToneMappingMaskModifier());
     }
-    
+
     return std::make_shared<VROShaderProgram>(vertexShader, fragmentShader, samplers, modifiers, attributes,
                                               driver);
 }
@@ -1087,4 +1145,325 @@ std::vector<std::string> VROShaderFactory::createColorLinearizationCode() {
         */
     };
     return code;
+}
+
+std::shared_ptr<VROShaderModifier> VROShaderFactory::createOcclusionDepthModifier() {
+    /*
+     This modifier samples the AR depth texture and writes depth to gl_FragDepth.
+
+     The camera background is normally rendered as a full-screen quad at a fixed depth,
+     but we want the depth buffer to reflect the REAL depth of the scene captured by
+     the AR depth sensor (e.g., LiDAR). This allows virtual objects to be properly
+     occluded by real-world surfaces.
+
+     The depth texture contains linear depth values in METERS from ARKit/ARCore.
+     We convert these to normalized device coordinates (NDC) that match how OpenGL
+     would compute depth for an object at that distance.
+
+     OpenGL perspective depth formula (for [0,1] depth range):
+       depth_ndc = (f * (z - n)) / (z * (f - n))
+
+     Where:
+       z = distance from camera in world units (meters)
+       n = near plane distance
+       f = far plane distance
+
+     IMPORTANT: The near/far planes are passed as uniforms (occlusion_z_near, occlusion_z_far)
+     and must be bound by the caller to match the actual projection matrix values.
+     This is critical because the far plane can be dynamic (extended for distant objects).
+
+     IMPORTANT: We sample from ar_depth_texture. The depth texture must be set via
+     material->getAmbientOcclusion().setTexture().
+
+     This modifier requires the ar_depth_texture sampler. We use the @sampler marker
+     to request it from the shader build system rather than declaring it as a uniform.
+     This ensures proper texture binding via VROMaterialShaderBinding.
+
+     We use _surface.diffuse_texcoord directly since the camera background material
+     already has the correct texture coordinate transform applied.
+     */
+    std::vector<std::string> modifierCode = {
+        // Use the AO map sampler which is bound to the depth texture by VROSceneRendererARCore
+        "uniform sampler2D ao_map;",
+
+        // Near and far planes - passed as uniforms for dynamic projection matching
+        "uniform highp float occlusion_z_near;",
+        "uniform highp float occlusion_z_far;",
+
+        // Sample real-world depth in meters from the depth texture
+        // Use diffuse_texcoord directly - it's already transformed for camera orientation
+        "highp float z = texture(ao_map, _surface.diffuse_texcoord).r;",
+
+        // Use the uniform values for near/far planes
+        "highp float n = occlusion_z_near;",
+        "highp float f = occlusion_z_far;",
+
+        // Convert linear depth (meters) to perspective-correct NDC depth
+        // Formula: depth_ndc = (f * (z - n)) / (z * (f - n))
+        "highp float depthNDC = 1.0;",
+        "if (z > 0.0 && z < f) {",
+        "    depthNDC = (f * (z - n)) / (z * (f - n));",
+        "    depthNDC = clamp(depthNDC, 0.0, 1.0);",
+        "}",
+
+        // Write the computed perspective depth
+        "gl_FragDepth = depthNDC;"
+    };
+
+    std::shared_ptr<VROShaderModifier> modifier = std::make_shared<VROShaderModifier>(
+        VROShaderEntryPoint::Fragment, modifierCode);
+    modifier->setName("occlusion_depth");
+
+    modifier->setUniformBinder("occlusion_z_near", VROShaderProperty::Float,
+        [](VROUniform *uniform,
+           const VROGeometry *geometry, const VROMaterial *material) {
+            uniform->setFloat(0.1f);
+        });
+
+    modifier->setUniformBinder("occlusion_z_far", VROShaderProperty::Float,
+        [](VROUniform *uniform,
+           const VROGeometry *geometry, const VROMaterial *material) {
+            uniform->setFloat(100.0f);
+        });
+
+    return modifier;
+}
+
+std::shared_ptr<VROShaderModifier> VROShaderFactory::createOcclusionMaskModifier() {
+    /*
+     This modifier is applied to virtual 3D objects to enable real-world occlusion.
+     It samples the AR depth texture at the fragment's screen position and discards
+     fragments where the virtual object is behind real-world surfaces.
+
+     The depth texture contains linear depth values in METERS from the AR framework
+     (ARKit LiDAR on iOS, ARCore depth on Android).
+
+     How it works:
+     1. Calculate screen-space UV from gl_FragCoord
+     2. Apply the depth texture transform for correct camera orientation
+     3. Sample the real-world depth at that screen position
+     4. Compare with the virtual object's distance from the camera
+     5. Discard the fragment if the virtual object is behind the real surface
+
+     Required uniforms (bound via setUniformBinder):
+     - ar_camera_position: Camera position in world space
+     - ar_viewport_size: Viewport dimensions in pixels
+     - ar_depth_texture_transform: Transform from screen UV to depth texture UV
+
+     The ar_depth_texture sampler is bound via the @sampler marker, which tells
+     VROMaterialShaderBinding to look it up as a global texture (ARDepthMap).
+     */
+    std::vector<std::string> modifierCode = {
+        // Request the ar_occlusion_depth_texture sampler via marker (binds to global ARDepthMap)
+        "uniform sampler2D ar_occlusion_depth_texture;",
+        "// @sampler ar_occlusion_depth_texture",
+
+        // Camera position and forward direction in world space (bound dynamically)
+        "uniform highp vec3 ar_camera_position;",
+
+        // Viewport size for screen-space UV calculation (bound dynamically, xy components used)
+        "uniform highp vec3 ar_viewport_size;",
+
+        // Depth texture transform for coordinate mapping (bound dynamically)
+        "uniform highp mat4 ar_depth_texture_transform;",
+
+        // View matrix needed for planar depth calculation
+        "uniform highp mat4 view_matrix;",
+
+        // Calculate screen-space UV from fragment position
+        // gl_FragCoord gives us the pixel position in screen space with origin at bottom-left
+        // We need to flip Y since textures/depth maps have origin at top-left
+        "highp vec2 screenUV = gl_FragCoord.xy / ar_viewport_size.xy;",
+        "screenUV.y = 1.0 - screenUV.y;",
+
+        // Apply depth texture transform for correct orientation
+        "highp vec2 depthUV = (ar_depth_texture_transform * vec4(screenUV, 0.0, 1.0)).xy;",
+
+        // Skip occlusion if depth UV is out of bounds (no depth data for this screen position,
+        // e.g. monocular depth ScaleFill crop doesn't cover the full screen)
+        "if (depthUV.x >= 0.0 && depthUV.x <= 1.0 && depthUV.y >= 0.0 && depthUV.y <= 1.0) {",
+
+        // Sample real-world depth at this screen position (in meters)
+        "highp float realWorldDepth = texture(ar_occlusion_depth_texture, depthUV).r;",
+
+        // Calculate virtual object's distance from camera (Planar Depth)
+        "highp float virtualDepth = -(view_matrix * vec4(_surface.position, 1.0)).z;",
+
+        // Apply occlusion: discard fragment if virtual object is behind real-world surface
+        "highp float occlusionBias = realWorldDepth * 0.08;",
+        "if (realWorldDepth > 0.0 && virtualDepth > (realWorldDepth + occlusionBias)) {",
+        "    discard;",
+        "}",
+        "}"
+    };
+
+    std::shared_ptr<VROShaderModifier> modifier = std::make_shared<VROShaderModifier>(
+        VROShaderEntryPoint::Fragment, modifierCode);
+    modifier->setName("occlusion_mask");
+
+    return modifier;
+}
+
+std::shared_ptr<VROShaderModifier> VROShaderFactory::createDepthDebugModifier() {
+    /*
+     This modifier visualizes the depth texture as a color overlay on the camera background.
+     It blends the camera image with a depth-based color gradient:
+     - Red = close objects (0-1 meters)
+     - Yellow = medium distance (1-3 meters)
+     - Green = medium-far (3-5 meters)
+     - Cyan = far (5-10 meters)
+     - Blue = very far (10+ meters)
+     - Magenta = no depth data (invalid/zero)
+
+     This is useful for debugging whether the depth texture is being sampled correctly
+     and whether the coordinate transform is working properly.
+
+     NOTE: This modifier runs at Surface entry point AFTER the YCbCr conversion has happened,
+     so _surface.diffuse_color already contains the camera RGB image.
+
+     IMPORTANT: We use the diffuse_texcoord directly since the camera background material
+     already has the correct texture coordinate transform applied.
+
+     This modifier declares the ar_depth_texture sampler uniform. The @sampler marker
+     tells buildShader to add it to the samplers list for proper texture binding.
+     Both the uniform declaration AND the @sampler marker are needed:
+     - Uniform declaration: Makes the sampler available in the shader
+     - @sampler marker: Ensures the texture is bound via VROMaterialShaderBinding
+
+     The occlusion depth modifier also uses this sampler but does NOT declare it
+     (to avoid duplicate declarations). It only has the @sampler marker.
+     */
+    std::vector<std::string> modifierCode = {
+        // Declare the AR depth texture sampler uniform
+        // Use ar_occlusion_depth_texture which always binds to the global ARDepthMap
+        "uniform sampler2D ar_occlusion_depth_texture;",
+        "// @sampler ar_occlusion_depth_texture",
+        "uniform highp float depth_debug_opacity;",
+        
+        // Uniforms for correct coordinate mapping
+        "uniform highp vec3 ar_viewport_size;",
+        "uniform highp mat4 ar_depth_texture_transform;",
+
+        // Calculate screen-space UV from fragment position
+        "highp vec2 screenUV = gl_FragCoord.xy / ar_viewport_size.xy;",
+        "screenUV.y = 1.0 - screenUV.y;",
+
+        // Apply depth texture transform for correct orientation
+        "highp vec2 depthUV = (ar_depth_texture_transform * vec4(screenUV, 0.0, 1.0)).xy;",
+
+        // Check if UV is out of bounds (no depth data for this region)
+        "bool depthOutOfBounds = depthUV.x < 0.0 || depthUV.x > 1.0 || depthUV.y < 0.0 || depthUV.y > 1.0;",
+        "depthUV = clamp(depthUV, 0.0, 1.0);",
+
+        // Sample depth in meters using the correct depth UVs
+        "highp float depth = depthOutOfBounds ? 0.0 : texture(ar_occlusion_depth_texture, depthUV).r;",
+
+        // Normalize depth to 0-1 using inverse (close=1, far=0) for Turbo-like colormap
+        "highp float maxDepth = 10.0;",
+        "highp float t = (depthOutOfBounds || depth <= 0.001) ? -1.0 : 1.0 - clamp(depth / maxDepth, 0.0, 1.0);",
+
+        // Turbo colormap approximation (Google Research)
+        "highp vec3 depthColor;",
+        "if (t < 0.0) {",
+        "    depthColor = vec3(1.0, 0.0, 1.0);",  // magenta = no data
+        "} else {",
+        "    highp float r = clamp(0.13572 + t * (4.61539 + t * (-42.6603 + t * (132.13 + t * (-152.548 + t * 56.3014)))), 0.0, 1.0);",
+        "    highp float g = clamp(0.09140 + t * (2.26400 + t * ( -7.9399 + t * ( 12.15  + t * (  -5.160 + t * 0.0000)))), 0.0, 1.0);",
+        "    highp float b = clamp(0.10667 + t * (12.7520 + t * (-60.5820 + t * (132.87  + t * (-134.650 + t * 51.2130)))), 0.0, 1.0);",
+        "    depthColor = vec3(r, g, b);",
+        "}",
+
+        "_surface.diffuse_color.rgb = mix(_surface.diffuse_color.rgb, depthColor, depth_debug_opacity);"
+    };
+
+    std::shared_ptr<VROShaderModifier> modifier = std::make_shared<VROShaderModifier>(
+        VROShaderEntryPoint::Surface, modifierCode);
+    modifier->setName("depth_debug");
+
+    return modifier;
+}
+
+std::shared_ptr<VROShaderModifier> VROShaderFactory::createSemanticDebugModifier() {
+    /*
+     This modifier visualizes the semantic segmentation texture as a color overlay on the
+     camera background. Each real-world label is mapped to a distinct color:
+       0  = unlabeled  → no overlay (camera feed through)
+       1  = sky        → light blue  (0.53, 0.81, 0.98)
+       2  = building   → gray        (0.60, 0.60, 0.60)
+       3  = tree       → green       (0.13, 0.55, 0.13)
+       4  = road       → dark gray   (0.25, 0.25, 0.25)
+       5  = sidewalk   → tan         (0.82, 0.71, 0.55)
+       6  = terrain    → brown       (0.55, 0.27, 0.07)
+       7  = structure  → orange      (1.00, 0.55, 0.00)
+       8  = object     → yellow      (1.00, 1.00, 0.00)
+       9  = vehicle    → red         (1.00, 0.15, 0.15)
+       10 = person     → magenta     (1.00, 0.00, 1.00)
+       11 = water      → blue        (0.00, 0.40, 1.00)
+
+     Coordinate mapping follows the same screen-UV → depth-texture-transform pattern
+     used by createDepthDebugModifier(). The @sampler annotation binds semantic_texture
+     to VROGlobalTextureType::SemanticMap, which is populated each frame by
+     VRORenderer::setSemanticTexture().
+
+     NOTE: ar_viewport_size and ar_depth_texture_transform uniforms must be bound via
+     setUniformBinder() in VROViewAR, same as the depth debug modifier.
+     */
+    std::vector<std::string> modifierCode = {
+        "uniform sampler2D semantic_texture;",
+        "// @sampler semantic_texture",
+
+        "uniform highp vec3 ar_viewport_size;",
+        // ar_semantic_texture_transform = getViewportToCameraImageTransform() in GL convention (y=0 bottom).
+        // Do NOT flip Y before applying — gl_FragCoord is already bottom-left origin, matching this transform.
+        "uniform highp mat4 ar_semantic_texture_transform;",
+
+        // No Y-flip: ar_semantic_texture_transform is in GL convention (y=0 bottom),
+        // matching gl_FragCoord directly.
+        "highp vec2 screenUV = gl_FragCoord.xy / ar_viewport_size.xy;",
+        "highp vec2 semUV = (ar_semantic_texture_transform * vec4(screenUV, 0.0, 1.0)).xy;",
+
+        "bool semOutOfBounds = semUV.x < 0.0 || semUV.x > 1.0 || semUV.y < 0.0 || semUV.y > 1.0;",
+        "semUV = clamp(semUV, 0.0, 1.0);",
+
+        "highp float label_raw = semOutOfBounds ? 0.0 : texture(semantic_texture, semUV).r * 255.0;",
+        "int semLabel = int(floor(label_raw + 0.5));",
+
+        "highp vec3 semColor;",
+        "highp float semAlpha;",
+        "if (semLabel == 0 || semOutOfBounds) {",
+        "    semColor = vec3(0.0, 0.0, 0.0); semAlpha = 0.0;",   // unlabeled — transparent
+        "} else if (semLabel == 1) {",
+        "    semColor = vec3(0.53, 0.81, 0.98); semAlpha = 0.6;", // sky
+        "} else if (semLabel == 2) {",
+        "    semColor = vec3(0.60, 0.60, 0.60); semAlpha = 0.6;", // building
+        "} else if (semLabel == 3) {",
+        "    semColor = vec3(0.13, 0.55, 0.13); semAlpha = 0.6;", // tree
+        "} else if (semLabel == 4) {",
+        "    semColor = vec3(0.25, 0.25, 0.25); semAlpha = 0.6;", // road
+        "} else if (semLabel == 5) {",
+        "    semColor = vec3(0.82, 0.71, 0.55); semAlpha = 0.6;", // sidewalk
+        "} else if (semLabel == 6) {",
+        "    semColor = vec3(0.55, 0.27, 0.07); semAlpha = 0.6;", // terrain
+        "} else if (semLabel == 7) {",
+        "    semColor = vec3(1.00, 0.55, 0.00); semAlpha = 0.6;", // structure
+        "} else if (semLabel == 8) {",
+        "    semColor = vec3(1.00, 1.00, 0.00); semAlpha = 0.6;", // object
+        "} else if (semLabel == 9) {",
+        "    semColor = vec3(1.00, 0.15, 0.15); semAlpha = 0.6;", // vehicle
+        "} else if (semLabel == 10) {",
+        "    semColor = vec3(1.00, 0.00, 1.00); semAlpha = 0.6;", // person
+        "} else if (semLabel == 11) {",
+        "    semColor = vec3(0.00, 0.40, 1.00); semAlpha = 0.6;", // water
+        "} else {",
+        "    semColor = vec3(1.00, 1.00, 1.00); semAlpha = 0.3;", // unknown label
+        "}",
+
+        "_surface.diffuse_color.rgb = mix(_surface.diffuse_color.rgb, semColor, semAlpha);"
+    };
+
+    std::shared_ptr<VROShaderModifier> modifier = std::make_shared<VROShaderModifier>(
+        VROShaderEntryPoint::Surface, modifierCode);
+    modifier->setName("semantic_debug");
+
+    return modifier;
 }

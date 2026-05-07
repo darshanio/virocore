@@ -26,999 +26,2816 @@
 
 #include "VROARSessionARCore.h"
 #include "VROARAnchor.h"
-#include "VROARPlaneAnchor.h"
-#include "VROTexture.h"
-#include "VRODriver.h"
-#include "VROScene.h"
-#include "VROTextureSubstrateOpenGL.h"
-#include "VROLog.h"
-#include <algorithm>
-#include "VROCameraTexture.h"
-#include "VROPlatformUtil.h"
-#include "VROStringUtil.h"
-#include "VROARImageTargetAndroid.h"
-#include <VROImageAndroid.h>
+#include "VROGeospatialAnchor.h"
 #include "VROARHitTestResult.h"
-#include "VROFrameSynchronizer.h"
+#include "VROTextureSubstrateOpenGL.h"
+#include "VRODriverOpenGL.h"
+#include "VROARImageTargetAndroid.h"
+#include "VROARPlaneAnchor.h"
+#include "VROCameraTexture.h"
 #include "VROCloudAnchorProviderARCore.h"
+#include "VROCloudAnchorProviderReactVision.h"
+#include <fstream>
+
+#ifndef RVCCA_AVAILABLE
+#  define RVCCA_AVAILABLE 0
+#endif
+#if RVCCA_AVAILABLE
+#  include "ReactVisionCCA/RVCCAGeospatialProvider.h"
+#  include "ReactVisionCCA/RVCCACloudAnchorProvider.h"
+#endif
+#include "VRODriver.h"
+#include "VROFrameSynchronizer.h"
+#include "VROLog.h"
+#include "VROPlatformUtil.h"
+#include "VROScene.h"
+#include "VROStringUtil.h"
+#include "VROTexture.h"
+#include "VROTextureSubstrateOpenGL.h"
+#include <VROImageAndroid.h>
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <fcntl.h>
+#include <unistd.h>
 
 static bool kDebugTracking = false;
 
-VROARSessionARCore::VROARSessionARCore(std::shared_ptr<VRODriverOpenGL> driver) :
-    VROARSession(VROTrackingType::DOF6, VROWorldAlignment::Gravity),
-    _lightingMode(arcore::LightingMode::AmbientIntensity),
-    _planeFindingMode(arcore::PlaneFindingMode::Horizontal),
-    _updateMode(arcore::UpdateMode::Blocking),
-    _cloudAnchorMode(arcore::CloudAnchorMode::Enabled),
-    _focusMode(arcore::FocusMode::FIXED_FOCUS),
-    _cameraTextureId(0),
-    _displayRotation(VROARDisplayRotation::R0),
-    _rotatedImageDataLength(0),
-    _rotatedImageData(nullptr) {
-
-    _session = nullptr;
-    _frame = nullptr;
-    _frameCount = 0;
+// Generate a random UUID v4 string (xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx).
+static std::string generateUUID() {
+    uint8_t b[16];
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd >= 0) {
+        read(fd, b, sizeof(b));
+        close(fd);
+    } else {
+        // Fallback: zero-filled (shouldn't happen on Android).
+        memset(b, 0, sizeof(b));
+    }
+    b[6] = (b[6] & 0x0f) | 0x40; // version 4
+    b[8] = (b[8] & 0x3f) | 0x80; // variant bits
+    char buf[37];
+    snprintf(buf, sizeof(buf),
+             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             b[0],b[1],b[2],b[3], b[4],b[5], b[6],b[7],
+             b[8],b[9], b[10],b[11],b[12],b[13],b[14],b[15]);
+    return std::string(buf);
 }
 
-void VROARSessionARCore::setARCoreSession(arcore::Session *session,
-                                          std::shared_ptr<VROFrameSynchronizer> synchronizer) {
-    _session = session;
-    _synchronizer = synchronizer;
+// Minimum plane size filter to prevent small artifacts from being detected
+// Planes smaller than this threshold will be ignored
+static const float kMinPlaneExtent = 0.10f;  // 10cm minimum size in any dimension
 
-    if (getImageTrackingImpl() == VROImageTrackingImpl::ARCore) {
-        _currentARCoreImageDatabase = _session->createAugmentedImageDatabase();
-    }
+VROARSessionARCore::VROARSessionARCore(std::shared_ptr<VRODriverOpenGL> driver)
+    : VROARSession(VROTrackingType::DOF6, VROWorldAlignment::Gravity),
+      _lightingMode(arcore::LightingMode::EnvironmentalHDR),
+      _planeFindingMode(arcore::PlaneFindingMode::Horizontal),
+      _updateMode(arcore::UpdateMode::Blocking),
+      _cloudAnchorMode(arcore::CloudAnchorMode::Enabled),
+      _focusMode(arcore::FocusMode::FIXED_FOCUS),
+      _depthMode(arcore::DepthMode::Disabled),
+      _semanticMode(arcore::SemanticMode::Disabled),
+      _geospatialMode(arcore::GeospatialMode::Disabled),
+      _cameraTextureId(0),
+      _displayRotation(VROARDisplayRotation::R0), _rotatedImageDataLength(0),
+      _rotatedImageData(nullptr),
+      _driver(driver) {
 
-    _cloudAnchorProvider = std::make_shared<VROCloudAnchorProviderARCore>(shared_from_this());
-    _synchronizer->addFrameListener(_cloudAnchorProvider);
-    _frame = _session->createFrame();
+  _session = nullptr;
+  _frame = nullptr;
+  _frameCount = 0;
+}
+
+void VROARSessionARCore::setARCoreSession(
+    arcore::Session *session,
+    std::shared_ptr<VROFrameSynchronizer> synchronizer) {
+  _session = session;
+  _synchronizer = synchronizer;
+
+  if (getImageTrackingImpl() == VROImageTrackingImpl::ARCore) {
+    _currentARCoreImageDatabase = _session->createAugmentedImageDatabase();
+  }
+
+  _cloudAnchorProvider =
+      std::make_shared<VROCloudAnchorProviderARCore>(shared_from_this());
+  _synchronizer->addFrameListener(_cloudAnchorProvider);
+  _frame = _session->createFrame();
 }
 
 GLuint VROARSessionARCore::getCameraTextureId() const {
-    return _cameraTextureId;
+  return _cameraTextureId;
 }
 
-void VROARSessionARCore::initCameraTexture(std::shared_ptr<VRODriverOpenGL> driver) {
-    // Generate the background texture
-    glGenTextures(1, &_cameraTextureId);
-    
-    glBindTexture(GL_TEXTURE_EXTERNAL_OES, _cameraTextureId);
-    glTexParameterf(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameterf(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+void VROARSessionARCore::invalidateCameraTexture() {
+  // The EGL context that owned _cameraTextureId has already been destroyed.
+  // Do NOT call glDeleteTextures — the ID is invalid in the new context and
+  // the old context is gone, so there is nothing to release on the GPU side.
+  // Simply forget the ID and the backing texture so initCameraTexture() will
+  // allocate fresh GL objects in the new context on the next renderFrame().
+  _cameraTextureId = 0;
+  _background.reset();
+  pinfo("AR camera texture invalidated after EGL context loss");
+}
 
-    std::unique_ptr<VROTextureSubstrate> substrate = std::unique_ptr<VROTextureSubstrateOpenGL>(
-            new VROTextureSubstrateOpenGL(GL_TEXTURE_EXTERNAL_OES, _cameraTextureId, driver, true));
-    _background = std::make_shared<VROTexture>(VROTextureType::TextureEGLImage, VROTextureInternalFormat::RGBA8,
-                                               std::move(substrate));
+void VROARSessionARCore::initCameraTexture(
+    std::shared_ptr<VRODriverOpenGL> driver) {
+  passert_msg(_session != nullptr,
+              "ARCore must be installed before setting camera texture");
 
-    passert_msg(_session != nullptr, "ARCore must be installed before setting camera texture");
+  // If the camera texture already exists (e.g. AR→AR scene switch on the same renderer),
+  // reuse it rather than leaking the old GL texture and creating a new one.
+  // Re-registering satisfies the ARCore requirement to call setCameraTextureName after
+  // every pause/resume cycle.
+  if (_cameraTextureId != 0) {
     _session->setCameraTextureName(_cameraTextureId);
+    return;
+  }
+
+  // Generate the background texture
+  glGenTextures(1, &_cameraTextureId);
+
+  glBindTexture(GL_TEXTURE_EXTERNAL_OES, _cameraTextureId);
+  glTexParameterf(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  glTexParameterf(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+  std::unique_ptr<VROTextureSubstrate> substrate =
+      std::unique_ptr<VROTextureSubstrateOpenGL>(new VROTextureSubstrateOpenGL(
+          GL_TEXTURE_EXTERNAL_OES, _cameraTextureId, driver, true));
+  _background = std::make_shared<VROTexture>(VROTextureType::TextureEGLImage,
+                                             VROTextureInternalFormat::RGBA8,
+                                             std::move(substrate));
+
+  _session->setCameraTextureName(_cameraTextureId);
 }
 
 VROARSessionARCore::~VROARSessionARCore() {
-    if (_frame) {
-        delete (_frame);
+  if (_frame) {
+    delete (_frame);
+  }
+
+  // Remove all anchors
+  pinfo("Removing all anchors (%d) from session", (int)_anchors.size());
+
+  std::vector<std::shared_ptr<VROARAnchorARCore>> anchorsToRemove = _anchors;
+  for (std::shared_ptr<VROARAnchorARCore> anchor : anchorsToRemove) {
+    removeAnchor(anchor);
+    if (kDebugTracking) {
+      pinfo("   Removed anchor %p on session destroy", anchor->getId().c_str());
     }
+  }
 
-    // Remove all anchors
-    pinfo("Removing all anchors (%d) from session", (int) _anchors.size());
+  if (_session != nullptr) {
+    pinfo("Destroying ARCore session");
 
-    std::vector<std::shared_ptr<VROARAnchorARCore>> anchorsToRemove = _anchors;
-    for (std::shared_ptr<VROARAnchorARCore> anchor : anchorsToRemove) {
-        removeAnchor(anchor);
-        if (kDebugTracking) {
-            pinfo("   Removed anchor %p on session destroy", anchor->getId().c_str());
-        }
+    // Deleting the session could take a few seconds, so to prevent blocking the
+    // main thread, they recommend pausing the session, then deleting on a
+    // background thread!
+    _session->pause();
+    VROPlatformDispatchAsyncBackground([this] { delete (_session); });
+
+    if (_currentARCoreImageDatabase != nullptr) {
+      delete (_currentARCoreImageDatabase);
     }
+  }
 
-    if (_session != nullptr) {
-        pinfo("Destroying ARCore session");
-
-        // Deleting the session could take a few seconds, so to prevent blocking the main thread,
-        // they recommend pausing the session, then deleting on a background thread!
-        _session->pause();
-        VROPlatformDispatchAsyncBackground([this] {
-            delete(_session);
-        });
-
-        if (_currentARCoreImageDatabase != nullptr) {
-            delete(_currentARCoreImageDatabase);
-        }
-    }
-
-    if (_rotatedImageData != nullptr) {
-        free (_rotatedImageData);
-    }
+  if (_rotatedImageData != nullptr) {
+    free(_rotatedImageData);
+  }
 }
 
 #pragma mark - Lifecycle and Setup
 
 void VROARSessionARCore::run() {
-    if (_session != nullptr) {
-        _session->resume();
-        pinfo("AR session resumed");
+  if (_session != nullptr) {
+    // ARCore requires setCameraTextureName to be called after every pause/resume cycle.
+    // Re-register here so the camera stream is always wired to our OES texture before
+    // ArSession_resume() opens the camera hardware.
+    if (_cameraTextureId != 0) {
+      _session->setCameraTextureName(_cameraTextureId);
     }
-    else {
-        pinfo("AR session not resumed: has not yet been configured");
-    }
+    _session->resume();
+    pinfo("AR session resumed");
+  } else {
+    pinfo("AR session not resumed: has not yet been configured");
+  }
 }
 
 void VROARSessionARCore::pause() {
-    if (_session != nullptr) {
-        _session->pause();
-        pinfo("AR session paused");
-    }
-    else {
-        pinfo("AR session not paused: has not yet been configured");
-    }
+  if (_session != nullptr) {
+    _session->pause();
+    pinfo("AR session paused");
+  } else {
+    pinfo("AR session not paused: has not yet been configured");
+  }
 }
 
 bool VROARSessionARCore::isReady() const {
-    return getScene() != nullptr && _session != nullptr;
+  return getScene() != nullptr && _session != nullptr;
 }
 
 void VROARSessionARCore::resetSession(bool resetTracking, bool removeAnchors) {
-    return; // no-op
+  return; // no-op
 }
 
-bool VROARSessionARCore::setAnchorDetection(std::set<VROAnchorDetection> types) {
-    std::set<VROAnchorDetection>::iterator it;
+bool VROARSessionARCore::setAnchorDetection(
+    std::set<VROAnchorDetection> types) {
+  std::set<VROAnchorDetection>::iterator it;
 
-    bool planesHorizontal = false;
-    bool planesVertical = false;
+  bool planesHorizontal = false;
+  bool planesVertical = false;
 
-    for (it = types.begin(); it != types.end(); it++) {
-        VROAnchorDetection type = *it;
-        switch (type) {
-            case VROAnchorDetection::PlanesHorizontal:
-                planesHorizontal = true;
-                break;
-            case VROAnchorDetection::PlanesVertical:
-                planesVertical = true;
-                break;
-        }
+  for (it = types.begin(); it != types.end(); it++) {
+    VROAnchorDetection type = *it;
+    switch (type) {
+    case VROAnchorDetection::PlanesHorizontal:
+      planesHorizontal = true;
+      break;
+    case VROAnchorDetection::PlanesVertical:
+      planesVertical = true;
+      break;
     }
+  }
 
-    if (planesHorizontal && planesVertical) {
-        _planeFindingMode = arcore::PlaneFindingMode::HorizontalAndVertical;
-    } else if (planesHorizontal) {
-        _planeFindingMode = arcore::PlaneFindingMode::Horizontal;
-    } else if (planesVertical) {
-        _planeFindingMode = arcore::PlaneFindingMode::Vertical;
-    } else {
-        _planeFindingMode = arcore::PlaneFindingMode::Disabled;
-    }
-    return updateARCoreConfig();
+  arcore::PlaneFindingMode newMode;
+  if (planesHorizontal && planesVertical) {
+    newMode = arcore::PlaneFindingMode::HorizontalAndVertical;
+  } else if (planesHorizontal) {
+    newMode = arcore::PlaneFindingMode::Horizontal;
+  } else if (planesVertical) {
+    newMode = arcore::PlaneFindingMode::Vertical;
+  } else {
+    newMode = arcore::PlaneFindingMode::Disabled;
+  }
+
+  // Avoid unnecessary reconfiguration if mode hasn't changed
+  if (_planeFindingMode == newMode) {
+    return true;
+  }
+
+  _planeFindingMode = newMode;
+  return updateARCoreConfig();
 }
 
-void VROARSessionARCore::setCloudAnchorProvider(VROCloudAnchorProvider provider) {
-    if (provider == VROCloudAnchorProvider::None) {
-        _cloudAnchorMode = arcore::CloudAnchorMode::Disabled;
-    } else {
-        _cloudAnchorMode = arcore::CloudAnchorMode::Enabled;
+void VROARSessionARCore::setReactVisionConfig(const std::string &apiKey,
+                                              const std::string &projectId,
+                                              const std::string &endpoint) {
+  _rvApiKey    = apiKey;
+  _rvProjectId = projectId;
+  _rvEndpoint  = endpoint;
+  // Credentials supplied — activate the ReactVision cloud anchor provider.
+  setCloudAnchorProvider(VROCloudAnchorProvider::ReactVision);
+#if RVCCA_AVAILABLE
+  // Also initialize the geospatial metadata provider so rvFindNearbyGeospatialAnchors,
+  // rvGetGeospatialAnchor, etc. work whenever provider="reactvision" is set.
+  // This must NOT enable ARCore geospatial mode (VPS) — that belongs to provider="arcore".
+  if (!_geospatialProviderRV && !_rvApiKey.empty() && !_rvProjectId.empty()) {
+    ReactVisionCCA::RVCCAGeospatialProvider::Config cfg;
+    cfg.apiKey    = _rvApiKey;
+    cfg.projectId = _rvProjectId;
+    if (!_rvEndpoint.empty()) cfg.endpoint = _rvEndpoint;
+    _geospatialProviderRV = std::make_shared<ReactVisionCCA::RVCCAGeospatialProvider>(cfg);
+    pinfo("VROARSessionARCore: ReactVision Geospatial provider initialized");
+  }
+#endif
+}
+
+void VROARSessionARCore::setCloudAnchorProvider(
+    VROCloudAnchorProvider provider) {
+
+  if (provider == VROCloudAnchorProvider::ReactVision) {
+    // ReactVision uses its own network backend and bypasses ARCore cloud anchors
+    // entirely (see hostCloudAnchor / resolveCloudAnchor — the _cloudAnchorProviderRV
+    // check short-circuits before _cloudAnchorMode is ever consulted).
+    // Do NOT call updateARCoreConfig() here: there is nothing to reconfigure for
+    // ARCore, and an unnecessary Pause/Configure/Resume resets VIO — causing
+    // "Insufficient visual features" when hostCloudAnchor runs in the same
+    // renderer-task batch.
+    if (!_cloudAnchorProviderRV && !_rvApiKey.empty() && !_rvProjectId.empty()) {
+      _cloudAnchorProviderRV = std::make_shared<VROCloudAnchorProviderReactVision>(
+          shared_from_this(), _rvApiKey, _rvProjectId, _rvEndpoint);
+      // Improvement 1 + 6B: register as frame listener so onFrameDidRender()
+      // drives multi-frame host accumulation and resolve localization.
+      if (_synchronizer) {
+        _synchronizer->addFrameListener(_cloudAnchorProviderRV);
+      }
+    } else if (_rvApiKey.empty()) {
+      pwarn("VROARSessionARCore: setReactVisionConfig() has not been called — "
+            "ReactVision Cloud Anchors unavailable.");
     }
-    updateARCoreConfig();
+    return;
+  }
+
+  // Tear down RV provider when switching to ARCore or None
+  if (_cloudAnchorProviderRV && _synchronizer) {
+    _synchronizer->removeFrameListener(_cloudAnchorProviderRV);
+  }
+  _cloudAnchorProviderRV.reset();
+
+  arcore::CloudAnchorMode newMode = (provider == VROCloudAnchorProvider::None)
+    ? arcore::CloudAnchorMode::Disabled
+    : arcore::CloudAnchorMode::Enabled;
+
+  // Avoid unnecessary reconfiguration if mode hasn't changed
+  if (_cloudAnchorMode == newMode) {
+    return;
+  }
+
+  _cloudAnchorMode = newMode;
+  updateARCoreConfig();
 }
 
 void VROARSessionARCore::setAutofocus(bool enabled) {
-    if (enabled) {
-        _focusMode = arcore::FocusMode::AUTO_FOCUS;
-    } else {
-        _focusMode = arcore::FocusMode::FIXED_FOCUS;
-    }
-    updateARCoreConfig();
+  arcore::FocusMode newMode = enabled ? arcore::FocusMode::AUTO_FOCUS : arcore::FocusMode::FIXED_FOCUS;
+
+  // Avoid unnecessary reconfiguration if mode hasn't changed
+  if (_focusMode == newMode) {
+    return;
+  }
+
+  _focusMode = newMode;
+  updateARCoreConfig();
 }
 
 bool VROARSessionARCore::isCameraAutoFocusEnabled() {
-    if (_focusMode == arcore::FocusMode::AUTO_FOCUS) {
-        return true;
-    }
-    return false;
+  if (_focusMode == arcore::FocusMode::AUTO_FOCUS) {
+    return true;
+  }
+  return false;
 }
 
-void VROARSessionARCore::setDisplayGeometry(VROARDisplayRotation rotation, int width, int height) {
-    _width = width;
-    _height = height;
-    _displayRotation = rotation;
-    if (_session) {
-        _session->setDisplayGeometry((int) rotation, width, height);
-    }
+void VROARSessionARCore::setDisplayGeometry(VROARDisplayRotation rotation,
+                                            int width, int height) {
+  _width = width;
+  _height = height;
+  _displayRotation = rotation;
+  if (_session) {
+    _session->setDisplayGeometry((int)rotation, width, height);
+  }
 }
 
-bool VROARSessionARCore::configure(arcore::LightingMode lightingMode, arcore::PlaneFindingMode planeFindingMode,
-                                   arcore::UpdateMode updateMode, arcore::CloudAnchorMode cloudAnchorMode) {
-    _lightingMode = lightingMode;
-    _planeFindingMode = planeFindingMode;
-    _updateMode = updateMode;
-    _cloudAnchorMode = cloudAnchorMode;
+bool VROARSessionARCore::configure(arcore::LightingMode lightingMode,
+                                   arcore::PlaneFindingMode planeFindingMode,
+                                   arcore::UpdateMode updateMode,
+                                   arcore::CloudAnchorMode cloudAnchorMode,
+                                   arcore::DepthMode depthMode,
+                                   arcore::SemanticMode semanticMode,
+                                   arcore::GeospatialMode geospatialMode) {
+  _lightingMode = lightingMode;
+  _planeFindingMode = planeFindingMode;
+  _updateMode = updateMode;
+  _cloudAnchorMode = cloudAnchorMode;
+  _depthMode = depthMode;
+  _semanticMode = semanticMode;
+  _geospatialMode = geospatialMode;
 
-    return updateARCoreConfig();
+  return updateARCoreConfig();
 }
 
 bool VROARSessionARCore::updateARCoreConfig() {
-    passert_msg(_session != nullptr, "ARCore must be installed before configuring session");
+  passert_msg(_session != nullptr,
+              "ARCore must be installed before configuring session");
 
-    arcore::Config *config = _session->createConfig(_lightingMode, _planeFindingMode, _updateMode,
-                                                    _cloudAnchorMode, _focusMode);
+  // Check if depth mode is supported on this device
+  arcore::DepthMode effectiveDepthMode = _depthMode;
+  if (_depthMode != arcore::DepthMode::Disabled) {
+    if (!_session->isDepthModeSupported(_depthMode)) {
+      pwarn("⚠️ Requested depth mode %d not supported on this device, falling back to DISABLED",
+            (int)_depthMode);
+      effectiveDepthMode = arcore::DepthMode::Disabled;
+    }
+  }
 
-    if (getImageTrackingImpl() == VROImageTrackingImpl::ARCore && _currentARCoreImageDatabase) {
-        config->setAugmentedImageDatabase(_currentARCoreImageDatabase);
+  // Check if semantic mode is supported on this device
+  arcore::SemanticMode effectiveSemanticMode = _semanticMode;
+  if (_semanticMode != arcore::SemanticMode::Disabled) {
+    if (!_session->isSemanticModeSupported(_semanticMode)) {
+      pwarn("⚠️ Requested semantic mode %d not supported on this device, falling back to DISABLED",
+            (int)_semanticMode);
+      effectiveSemanticMode = arcore::SemanticMode::Disabled;
     }
+  }
 
-    arcore::ConfigStatus status = _session->configure(config);
-    delete (config);
+  // Check if geospatial mode is supported on this device
+  // This prevents the configuration loop when play-services-location is not linked
+  arcore::GeospatialMode effectiveGeospatialMode = _geospatialMode;
+  if (_geospatialMode != arcore::GeospatialMode::Disabled) {
+    if (!_session->isGeospatialModeSupported(_geospatialMode)) {
+      pwarn("⚠️ Requested geospatial mode not supported (missing play-services-location or API key?), falling back to DISABLED");
+      effectiveGeospatialMode = arcore::GeospatialMode::Disabled;
+    }
+  }
 
-    if (status == arcore::ConfigStatus::Success) {
-        pinfo("Successfully configured AR session [lighting %d, planes %d, update %d, focus %d]",
-              _lightingMode, _planeFindingMode, _updateMode, _focusMode);
-        _session->resume();
-        return true;
+  arcore::Config *config =
+      _session->createConfig(_lightingMode, _planeFindingMode, _updateMode,
+                             _cloudAnchorMode, _focusMode, effectiveDepthMode, effectiveSemanticMode, effectiveGeospatialMode);
+
+  if (getImageTrackingImpl() == VROImageTrackingImpl::ARCore &&
+      _currentARCoreImageDatabase) {
+    config->setAugmentedImageDatabase(_currentARCoreImageDatabase);
+  }
+
+  // ARCore requires the session to be paused before calling configure()
+  _session->pause();
+
+  arcore::ConfigStatus status = _session->configure(config);
+  delete (config);
+
+  if (status == arcore::ConfigStatus::Success) {
+    _session->resume();
+    // After pause→configure→resume the camera hardware stream is reset.
+    // Re-register the camera texture name so ARCore reconnects its internal
+    // camera→OES-texture pipeline before the first update().  Without this,
+    // the Mali GPU driver fails to allocate the EGL image that backs the
+    // external OES texture (BAD ALLOC from gles_texture_egl_image_get_2d_template),
+    // which causes the camera feed to freeze after scene navigation.
+    if (_cameraTextureId != 0) {
+      _session->setCameraTextureName(_cameraTextureId);
     }
-    else if (status == arcore::ConfigStatus::UnsupportedConfiguration) {
-        pinfo("Failed to configure AR session: configuration not supported");
-        return false;
+    // After pause→configure→resume, ArFrame's internal state is stale.
+    // Any ArFrame_acquire* call on _frame before the next update() may
+    // access freed ARCore-internal memory (SEGV_MAPERR).  Drive one update
+    // now so _frame is valid for any code that runs before the GL render loop
+    // gets a chance to call updateFrame() again (e.g. hostCloudAnchor queued
+    // in the same renderer-task batch as setReactVisionConfig).
+    if (_frame) {
+      _session->update(_frame);
     }
-    else if (status == arcore::ConfigStatus::SessionNotPaused) {
-        pinfo("Failed to change AR configuration: session must be paused");
-        return false;
+    return true;
+  } else {
+    pwarn("Failed to configure AR session (status %d)", (int)status);
+    _session->resume();
+    // Re-register camera texture on failed configure as well — the session
+    // was still paused/resumed and the camera stream was reset.
+    if (_cameraTextureId != 0) {
+      _session->setCameraTextureName(_cameraTextureId);
     }
-    else {
-        pinfo("Unknown error updating AR configuration");
-        return false;
+    if (_frame) {
+      _session->update(_frame);
     }
+    return false;
+  }
 }
 
 void VROARSessionARCore::setScene(std::shared_ptr<VROScene> scene) {
-    VROARSession::setScene(scene);
+  VROARSession::setScene(scene);
 }
 
-void VROARSessionARCore::setDelegate(std::shared_ptr<VROARSessionDelegate> delegate) {
-    VROARSession::setDelegate(delegate);
-    // When we add a new delegate, notify it of all the anchors we've found thus far
-    if (delegate) {
-        for (auto it = _anchors.begin(); it != _anchors.end();it++) {
-            delegate->anchorWasDetected(*it);
-        }
+void VROARSessionARCore::setDelegate(
+    std::shared_ptr<VROARSessionDelegate> delegate) {
+  VROARSession::setDelegate(delegate);
+  // When we add a new delegate, notify it of all the anchors we've found thus
+  // far
+  if (delegate) {
+    for (auto it = _anchors.begin(); it != _anchors.end(); it++) {
+      delegate->anchorWasDetected(*it);
     }
+  }
 }
 
 void VROARSessionARCore::setViewport(VROViewport viewport) {
-    _viewport = viewport;
+  _viewport = viewport;
 }
 
 void VROARSessionARCore::setOrientation(VROCameraOrientation orientation) {
-    _orientation = orientation;
+  _orientation = orientation;
 }
 
 void VROARSessionARCore::setWorldOrigin(VROMatrix4f relativeTransform) {
-    // no-op on Android
+  // no-op on Android
 }
 
 #pragma mark - AR Image Targets
 
-void VROARSessionARCore::loadARImageDatabase(std::shared_ptr<VROARImageDatabase> arImageDatabase) {
-    std::weak_ptr<VROARSessionARCore> w_arsession = shared_from_this();
-    VROPlatformDispatchAsyncBackground([arImageDatabase, w_arsession] {
+void VROARSessionARCore::loadARImageDatabase(
+    std::shared_ptr<VROARImageDatabase> arImageDatabase) {
+  std::weak_ptr<VROARSessionARCore> w_arsession = shared_from_this();
+  VROPlatformDispatchAsyncBackground([arImageDatabase, w_arsession] {
+    std::shared_ptr<VROARSessionARCore> arsession = w_arsession.lock();
+    if (arsession) {
+
+      // load the image database from the given fileBuffer
+      arcore::AugmentedImageDatabase *loadedDatabase =
+          arsession->_session->createAugmentedImageDatabase(
+              arImageDatabase->getFileData(), arImageDatabase->getLength());
+
+      // add all the image targets to the database that were added through
+      // addARImageTarget
+      for (int i = 0; i < arsession->_imageTargets.size(); i++) {
+        arsession->addTargetToDatabase(arsession->_imageTargets[i],
+                                       loadedDatabase);
+      }
+
+      // update the ARCore config on the renderer thread
+      VROPlatformDispatchAsyncRenderer([w_arsession, loadedDatabase] {
         std::shared_ptr<VROARSessionARCore> arsession = w_arsession.lock();
         if (arsession) {
-
-            // load the image database from the given fileBuffer
-            arcore::AugmentedImageDatabase *loadedDatabase =
-                    arsession->_session->createAugmentedImageDatabase(arImageDatabase->getFileData(),
-                                                                      arImageDatabase->getLength());
-
-            // add all the image targets to the database that were added through addARImageTarget
-            for (int i = 0; i < arsession->_imageTargets.size(); i++) {
-                arsession->addTargetToDatabase(arsession->_imageTargets[i], loadedDatabase);
-            }
-
-            // update the ARCore config on the renderer thread
-            VROPlatformDispatchAsyncRenderer([w_arsession, loadedDatabase] {
-                std::shared_ptr<VROARSessionARCore> arsession = w_arsession.lock();
-                if (arsession) {
-                    arsession->_currentARCoreImageDatabase = loadedDatabase;
-                    arsession->updateARCoreConfig();
-                }
-            });
+          arsession->_currentARCoreImageDatabase = loadedDatabase;
+          arsession->updateARCoreConfig();
         }
-    });
+      });
+    }
+  });
 }
 
 void VROARSessionARCore::unloadARImageDatabase() {
-    std::weak_ptr<VROARSessionARCore> w_arsession = shared_from_this();
-    VROPlatformDispatchAsyncBackground([w_arsession] {
+  std::weak_ptr<VROARSessionARCore> w_arsession = shared_from_this();
+  VROPlatformDispatchAsyncBackground([w_arsession] {
+    std::shared_ptr<VROARSessionARCore> arsession = w_arsession.lock();
+    if (arsession) {
+
+      // create an empty image database
+      arcore::AugmentedImageDatabase *database =
+          arsession->_session->createAugmentedImageDatabase();
+
+      // add all the image targets to the database that were added through
+      // addARImageTarget
+      for (int i = 0; i < arsession->_imageTargets.size(); i++) {
+        arsession->addTargetToDatabase(arsession->_imageTargets[i], database);
+      }
+
+      // update the ARCore config on the renderer thread
+      VROPlatformDispatchAsyncRenderer([w_arsession, database] {
         std::shared_ptr<VROARSessionARCore> arsession = w_arsession.lock();
         if (arsession) {
-
-            // create an empty image database
-            arcore::AugmentedImageDatabase *database = arsession->_session->createAugmentedImageDatabase();
-
-            // add all the image targets to the database that were added through addARImageTarget
-            for (int i = 0; i < arsession->_imageTargets.size(); i++) {
-                arsession->addTargetToDatabase(arsession->_imageTargets[i], database);
-            }
-
-            // update the ARCore config on the renderer thread
-            VROPlatformDispatchAsyncRenderer([w_arsession, database] {
-                std::shared_ptr<VROARSessionARCore> arsession = w_arsession.lock();
-                if (arsession) {
-                    arsession->_currentARCoreImageDatabase = database;
-                    arsession->updateARCoreConfig();
-                }
-            });
+          arsession->_currentARCoreImageDatabase = database;
+          arsession->updateARCoreConfig();
         }
+      });
+    }
+  });
+}
+
+void VROARSessionARCore::addARImageTarget(
+    std::shared_ptr<VROARImageTarget> target) {
+  // on Android we always use Viro tracking implementation
+  target->initWithTrackingImpl(getImageTrackingImpl());
+  if (getImageTrackingImpl() == VROImageTrackingImpl::ARCore) {
+    _imageTargets.push_back(target);
+    std::weak_ptr<VROARSessionARCore> w_arsession = shared_from_this();
+    VROPlatformDispatchAsyncBackground([target, w_arsession] {
+      std::shared_ptr<VROARSessionARCore> arsession = w_arsession.lock();
+      if (arsession) {
+        arsession->addTargetToDatabase(target,
+                                       arsession->_currentARCoreImageDatabase);
+        // update the ARCore config on the renderer thread
+        VROPlatformDispatchAsyncRenderer([w_arsession] {
+          std::shared_ptr<VROARSessionARCore> arsession = w_arsession.lock();
+          if (arsession) {
+            arsession->updateARCoreConfig();
+          }
+        });
+      }
     });
+  }
 }
 
-void VROARSessionARCore::addARImageTarget(std::shared_ptr<VROARImageTarget> target) {
-    // on Android we always use Viro tracking implementation
-    target->initWithTrackingImpl(getImageTrackingImpl());
-    if (getImageTrackingImpl() == VROImageTrackingImpl::ARCore) {
-        _imageTargets.push_back(target);
-        std::weak_ptr<VROARSessionARCore> w_arsession = shared_from_this();
-        VROPlatformDispatchAsyncBackground([target, w_arsession] {
-            std::shared_ptr<VROARSessionARCore> arsession = w_arsession.lock();
-            if (arsession) {
-                arsession->addTargetToDatabase(target, arsession->_currentARCoreImageDatabase);
-                // update the ARCore config on the renderer thread
-                VROPlatformDispatchAsyncRenderer([w_arsession] {
-                    std::shared_ptr<VROARSessionARCore> arsession = w_arsession.lock();
-                    if (arsession) {
-                        arsession->updateARCoreConfig();
-                    }
-                });
-            }
+void VROARSessionARCore::removeARImageTarget(
+    std::shared_ptr<VROARImageTarget> target) {
+  if (getImageTrackingImpl() == VROImageTrackingImpl::ARCore) {
+    // First, we remove the target from the list of targets
+    _imageTargets.erase(
+        std::remove_if(_imageTargets.begin(), _imageTargets.end(),
+                       [target](std::shared_ptr<VROARImageTarget> candidate) {
+                         return candidate == target;
+                       }),
+        _imageTargets.end());
+
+    arcore::AugmentedImageDatabase *oldDatabase = _currentARCoreImageDatabase;
+    _currentARCoreImageDatabase = _session->createAugmentedImageDatabase();
+    std::weak_ptr<VROARSessionARCore> w_arsession = shared_from_this();
+    VROPlatformDispatchAsyncBackground([w_arsession, target] {
+      std::shared_ptr<VROARSessionARCore> arsession = w_arsession.lock();
+      if (arsession) {
+        // Now add all the targets back into the database...
+        for (int i = 0; i < arsession->_imageTargets.size(); i++) {
+          arsession->addTargetToDatabase(
+              arsession->_imageTargets[i],
+              arsession->_currentARCoreImageDatabase);
+        }
+
+        // update the ARCore config on the renderer thread
+        VROPlatformDispatchAsyncRenderer([w_arsession] {
+          std::shared_ptr<VROARSessionARCore> arsession = w_arsession.lock();
+          if (arsession) {
+            // then "update" the config with the new target database.
+            arsession->updateARCoreConfig();
+          }
         });
-    }
+      }
+    });
+
+    delete (oldDatabase);
+  }
 }
 
-void VROARSessionARCore::removeARImageTarget(std::shared_ptr<VROARImageTarget> target) {
-    if (getImageTrackingImpl() == VROImageTrackingImpl::ARCore) {
-        // First, we remove the target from the list of targets
-        _imageTargets.erase(std::remove_if(_imageTargets.begin(), _imageTargets.end(),
-                                           [target](std::shared_ptr<VROARImageTarget> candidate) {
-                                               return candidate == target;
-                                           }), _imageTargets.end());
-
-        arcore::AugmentedImageDatabase *oldDatabase = _currentARCoreImageDatabase;
-        _currentARCoreImageDatabase = _session->createAugmentedImageDatabase();
-        std::weak_ptr<VROARSessionARCore> w_arsession = shared_from_this();
-        VROPlatformDispatchAsyncBackground([w_arsession, target] {
-            std::shared_ptr<VROARSessionARCore> arsession = w_arsession.lock();
-            if (arsession) {
-                // Now add all the targets back into the database...
-                for (int i = 0; i < arsession->_imageTargets.size(); i++) {
-                    arsession->addTargetToDatabase(arsession->_imageTargets[i],
-                                                   arsession->_currentARCoreImageDatabase);
-                }
-
-                // update the ARCore config on the renderer thread
-                VROPlatformDispatchAsyncRenderer([w_arsession] {
-                    std::shared_ptr<VROARSessionARCore> arsession = w_arsession.lock();
-                    if (arsession) {
-                        // then "update" the config with the new target database.
-                        arsession->updateARCoreConfig();
-                    }
-                });
-            }
-        });
-
-        delete (oldDatabase);
-    }
-}
-
-// Note: this function should be called on a background thread (as per guidance by ARCore for the
+// Note: this function should be called on a background thread (as per guidance
+// by ARCore for the
 //       addImageWithPhysicalSize function).
-void VROARSessionARCore::addTargetToDatabase(std::shared_ptr<VROARImageTarget> target,
-                                             arcore::AugmentedImageDatabase *database) {
-    std::shared_ptr<VROARImageTargetAndroid> targetAndroid = std::dynamic_pointer_cast<VROARImageTargetAndroid>(target);
+void VROARSessionARCore::addTargetToDatabase(
+    std::shared_ptr<VROARImageTarget> target,
+    arcore::AugmentedImageDatabase *database) {
+  std::shared_ptr<VROARImageTargetAndroid> targetAndroid =
+      std::dynamic_pointer_cast<VROARImageTargetAndroid>(target);
 
-    // a target w/o an image means it came from the database, so do nothing with them!
-    if (!targetAndroid->getImage()) {
-        return;
-    }
+  // a target w/o an image means it came from the database, so do nothing with
+  // them!
+  if (!targetAndroid->getImage()) {
+    return;
+  }
 
-    std::shared_ptr<VROImageAndroid> imageAndroid = std::dynamic_pointer_cast<VROImageAndroid>(targetAndroid->getImage());
+  std::shared_ptr<VROImageAndroid> imageAndroid =
+      std::dynamic_pointer_cast<VROImageAndroid>(targetAndroid->getImage());
 
-    size_t length;
-    size_t stride;
-    uint8_t *grayscaleImage = imageAndroid->getGrayscaleData(&length, &stride);
-    int32_t outIndex;
+  size_t length;
+  size_t stride;
+  uint8_t *grayscaleImage = imageAndroid->getGrayscaleData(&length, &stride);
+  int32_t outIndex;
 
-    int width = imageAndroid->getWidth();
-    int height = imageAndroid->getHeight();
-    rotateImageForOrientation(&grayscaleImage, &width, &height, &stride, target->getOrientation());
+  int width = imageAndroid->getWidth();
+  int height = imageAndroid->getHeight();
+  rotateImageForOrientation(&grayscaleImage, &width, &height, &stride,
+                            target->getOrientation());
 
-    database->addImageWithPhysicalSize(targetAndroid->getId().c_str(), grayscaleImage,
-                                       width, height, (int32_t) stride,
-                                       target->getPhysicalWidth(), &outIndex);
+  arcore::AugmentedImageDatabaseStatus status = database->addImageWithPhysicalSize(
+      targetAndroid->getId().c_str(), grayscaleImage, width, height,
+      (int32_t)stride, target->getPhysicalWidth(), &outIndex);
 
-    // Free that grayscaleImage now that we're done with it.
-    free(grayscaleImage);
+  // Free that grayscaleImage now that we're done with it.
+  free(grayscaleImage);
 }
 
-void VROARSessionARCore::rotateImageForOrientation(uint8_t **grayscaleImage, int *width, int *height,
-                                                   size_t *stride, VROImageOrientation orientation) {
-    int length = (*width) * (*height);
-    if (orientation == VROImageOrientation::Up) {
-        *stride = (size_t) *width;
-        uint8_t *rotatedImage = new uint8_t[length];
-        memcpy(rotatedImage, *grayscaleImage, (size_t) length);
-        *grayscaleImage = rotatedImage;
-        return;
-    } else if (orientation == VROImageOrientation::Down) {
-        // if the image is "upside down" then just reverse it...
-        *stride = (size_t) *width;
-        uint8_t *rotatedImage = new uint8_t[length];
-        int index;
-        for (int i = 0; i < *height; i++) {
-            for (int j = 0; j < *width; j++) {
-                index = j + i * *width;
-                rotatedImage[index] = (*grayscaleImage)[length - 1 - index];
-            }
-        }
-        *grayscaleImage = rotatedImage;
-    } else if (orientation == VROImageOrientation::Left) {
-        // if the image is to the "Left" then rotate it CW by 90 degrees
-        uint8_t *rotatedImage = new uint8_t[length];
-
-        for (int i = 0; i < *width; i++) {
-            for (int j = 0; j < *height; j++) {
-                rotatedImage[j + i * *height] = (*grayscaleImage)[(*height - 1 - j) * *width + i];
-            }
-        }
-
-        // since we rotated, swap the width and height.
-        int tempWidth = *width;
-        *width = *height;
-        *height = tempWidth;
-
-        // set the stride to the new width
-        *stride = (size_t) *width;
-
-        // set the grayscaleImage to the rotatedImage.
-        *grayscaleImage = rotatedImage;
-
-    } else if (orientation == VROImageOrientation::Right) {
-        // if the image is to the "Right" then rotate it CCW by 90 degrees
-        uint8_t *rotatedImage = new uint8_t[length];
-
-        for (int i = 0; i < *width; i++) {
-            for (int j = 0; j < *height; j++) {
-                rotatedImage[j + i * *height] = (*grayscaleImage)[(*width) * (j + 1) - i - 1];
-            }
-        }
-
-        // since we rotated, swap the width and height.
-        int tempWidth = *width;
-        *width = *height;
-        *height = tempWidth;
-
-        // set the stride to the new width
-        *stride = (size_t) *width;
-
-        // set the grayscaleImage to the rotatedImage.
-        *grayscaleImage = rotatedImage;
+void VROARSessionARCore::rotateImageForOrientation(
+    uint8_t **grayscaleImage, int *width, int *height, size_t *stride,
+    VROImageOrientation orientation) {
+  int length = (*width) * (*height);
+  if (orientation == VROImageOrientation::Up) {
+    *stride = (size_t)*width;
+    uint8_t *rotatedImage = new uint8_t[length];
+    memcpy(rotatedImage, *grayscaleImage, (size_t)length);
+    *grayscaleImage = rotatedImage;
+    return;
+  } else if (orientation == VROImageOrientation::Down) {
+    // if the image is "upside down" then just reverse it...
+    *stride = (size_t)*width;
+    uint8_t *rotatedImage = new uint8_t[length];
+    int index;
+    for (int i = 0; i < *height; i++) {
+      for (int j = 0; j < *width; j++) {
+        index = j + i * *width;
+        rotatedImage[index] = (*grayscaleImage)[length - 1 - index];
+      }
     }
+    *grayscaleImage = rotatedImage;
+  } else if (orientation == VROImageOrientation::Left) {
+    // if the image is to the "Left" then rotate it CW by 90 degrees
+    uint8_t *rotatedImage = new uint8_t[length];
+
+    for (int i = 0; i < *width; i++) {
+      for (int j = 0; j < *height; j++) {
+        rotatedImage[j + i * *height] =
+            (*grayscaleImage)[(*height - 1 - j) * *width + i];
+      }
+    }
+
+    // since we rotated, swap the width and height.
+    int tempWidth = *width;
+    *width = *height;
+    *height = tempWidth;
+
+    // set the stride to the new width
+    *stride = (size_t)*width;
+
+    // set the grayscaleImage to the rotatedImage.
+    *grayscaleImage = rotatedImage;
+
+  } else if (orientation == VROImageOrientation::Right) {
+    // if the image is to the "Right" then rotate it CCW by 90 degrees
+    uint8_t *rotatedImage = new uint8_t[length];
+
+    for (int i = 0; i < *width; i++) {
+      for (int j = 0; j < *height; j++) {
+        rotatedImage[j + i * *height] =
+            (*grayscaleImage)[(*width) * (j + 1) - i - 1];
+      }
+    }
+
+    // since we rotated, swap the width and height.
+    int tempWidth = *width;
+    *width = *height;
+    *height = tempWidth;
+
+    // set the stride to the new width
+    *stride = (size_t)*width;
+
+    // set the grayscaleImage to the rotatedImage.
+    *grayscaleImage = rotatedImage;
+  }
 }
 
 #pragma mark - Anchors
 
 void VROARSessionARCore::addAnchor(std::shared_ptr<VROARAnchor> anchor) {
-    std::shared_ptr<VROARAnchorARCore> vAnchor = std::dynamic_pointer_cast<VROARAnchorARCore>(anchor);
-    passert (vAnchor);
+  std::shared_ptr<VROARAnchorARCore> vAnchor =
+      std::dynamic_pointer_cast<VROARAnchorARCore>(anchor);
+  passert(vAnchor);
 
-    // Add the anchor under both its keys: the top-level anchor key and the trackable key.
-    // The former keeps anchors we've created and attached to trackables from being treated as
-    // "new" anchors in processUpdatedAnchors.
-    _nativeAnchorMap[VROStringUtil::toString64(vAnchor->getAnchorInternal()->getId())] = vAnchor;
-    _nativeAnchorMap[anchor->getId()] = vAnchor;
+  // Add the anchor under both its keys: the top-level anchor key and the
+  // trackable key. The former keeps anchors we've created and attached to
+  // trackables from being treated as "new" anchors in processUpdatedAnchors.
+  if (vAnchor->getAnchorInternal()) {
+    _nativeAnchorMap[VROStringUtil::toString64(
+        vAnchor->getAnchorInternal()->getId())] = vAnchor;
+  }
+  _nativeAnchorMap[anchor->getId()] = vAnchor;
 
-    if (kDebugTracking) {
-        pinfo("Added new new anchor [%p -- %p]",
-              VROStringUtil::toString64(vAnchor->getAnchorInternal()->getId()).c_str(),
-              anchor->getId().c_str());
-    }
+  if (kDebugTracking) {
+    std::string nativeId =
+        vAnchor->getAnchorInternal()
+            ? VROStringUtil::toString64(vAnchor->getAnchorInternal()->getId())
+            : "null";
+    pinfo("Added new new anchor [%s -- %s]", nativeId.c_str(),
+          anchor->getId().c_str());
+  }
 
-    std::shared_ptr<VROARSessionDelegate> delegate = getDelegate();
-    if (delegate) {
-        delegate->anchorWasDetected(anchor);
-    }
-    _anchors.push_back(vAnchor);
+  std::shared_ptr<VROARSessionDelegate> delegate = getDelegate();
+  if (delegate) {
+    delegate->anchorWasDetected(anchor);
+  }
+  _anchors.push_back(vAnchor);
 }
 
 void VROARSessionARCore::removeAnchor(std::shared_ptr<VROARAnchor> anchor) {
-    if (kDebugTracking) {
-        pinfo("Removing anchor: anchor count %d, native anchor map size %d",
-              (int) _anchors.size(), (int) _nativeAnchorMap.size());
-    }
-    _anchors.erase(std::remove_if(_anchors.begin(), _anchors.end(),
-                                 [anchor](std::shared_ptr<VROARAnchor> candidate) {
-                                     return candidate == anchor;
-                                 }), _anchors.end());
+  if (kDebugTracking) {
+    pinfo("Removing anchor: anchor count %d, native anchor map size %d",
+          (int)_anchors.size(), (int)_nativeAnchorMap.size());
+  }
+  _anchors.erase(
+      std::remove_if(_anchors.begin(), _anchors.end(),
+                     [anchor](std::shared_ptr<VROARAnchor> candidate) {
+                       return candidate == anchor;
+                     }),
+      _anchors.end());
 
-    for (auto it = _nativeAnchorMap.begin(); it != _nativeAnchorMap.end();) {
-        if (it->second == anchor) {
-            it = _nativeAnchorMap.erase(it);
-        } else {
-            ++it;
-        }
+  for (auto it = _nativeAnchorMap.begin(); it != _nativeAnchorMap.end();) {
+    if (it->second == anchor) {
+      it = _nativeAnchorMap.erase(it);
+    } else {
+      ++it;
     }
-    if (kDebugTracking) {
-        pinfo("   Anchor count after %d, native anchor map size after %d",
-              (int) _anchors.size(), (int) _nativeAnchorMap.size());
-    }
+  }
+  if (kDebugTracking) {
+    pinfo("   Anchor count after %d, native anchor map size after %d",
+          (int)_anchors.size(), (int)_nativeAnchorMap.size());
+  }
 
-    std::shared_ptr<VROARSessionDelegate> delegate = getDelegate();
-    if (delegate) {
-        delegate->anchorWasRemoved(anchor);
-    }
+  std::shared_ptr<VROARSessionDelegate> delegate = getDelegate();
+  if (delegate) {
+    delegate->anchorWasRemoved(anchor);
+  }
 }
 
 void VROARSessionARCore::updateAnchor(std::shared_ptr<VROARAnchor> anchor) {
-    std::shared_ptr<VROARSessionDelegate> delegate = getDelegate();
-    if (delegate) {
-        delegate->anchorWillUpdate(anchor);
-    }
-    anchor->updateNodeTransform();
-    if (delegate) {
-        delegate->anchorDidUpdate(anchor);
-    }
+  std::shared_ptr<VROARSessionDelegate> delegate = getDelegate();
+  if (delegate) {
+    delegate->anchorWillUpdate(anchor);
+  }
+  anchor->updateNodeTransform();
+  if (delegate) {
+    delegate->anchorDidUpdate(anchor);
+  }
 }
 
-void VROARSessionARCore::hostCloudAnchor(std::shared_ptr<VROARAnchor> anchor,
-                                         std::function<void(std::shared_ptr<VROARAnchor>)> onSuccess,
-                                         std::function<void(std::string error)> onFailure) {
-    if (_cloudAnchorMode == arcore::CloudAnchorMode::Disabled) {
-        pwarn("Cloud anchors are disabled, ignoring anchor host request");
-        return;
-    }
-    _cloudAnchorProvider->hostCloudAnchor(anchor, onSuccess, onFailure);
+void VROARSessionARCore::hostCloudAnchor(
+    std::shared_ptr<VROARAnchor> anchor,
+    int ttlDays,
+    std::function<void(std::shared_ptr<VROARAnchor>)> onSuccess,
+    std::function<void(std::string error)> onFailure) {
+
+  // ReactVision path — bypasses ARCore cloud anchors entirely
+  if (_cloudAnchorProviderRV) {
+    _cloudAnchorProviderRV->hostCloudAnchor(anchor, ttlDays, onSuccess, onFailure);
+    return;
+  }
+
+  if (_cloudAnchorMode == arcore::CloudAnchorMode::Disabled) {
+    pwarn("Cloud anchors are disabled, ignoring anchor host request");
+    return;
+  }
+  _cloudAnchorProvider->hostCloudAnchor(anchor, ttlDays, onSuccess, onFailure);
 }
 
-void VROARSessionARCore::resolveCloudAnchor(std::string cloudAnchorId,
-                                            std::function<void(
-                                            std::shared_ptr<VROARAnchor> anchor)> onSuccess,
-                                            std::function<void(std::string error)> onFailure) {
-    if (_cloudAnchorMode == arcore::CloudAnchorMode::Disabled) {
-        pwarn("Cloud anchors are disabled, ignoring anchor resolve request");
-        return;
-    }
-    _cloudAnchorProvider->resolveCloudAnchor(cloudAnchorId, onSuccess, onFailure);
+void VROARSessionARCore::resolveCloudAnchor(
+    std::string cloudAnchorId,
+    std::function<void(std::shared_ptr<VROARAnchor> anchor)> onSuccess,
+    std::function<void(std::string error)> onFailure) {
+
+  // ReactVision path — bypasses ARCore cloud anchors entirely
+  if (_cloudAnchorProviderRV) {
+    _cloudAnchorProviderRV->resolveCloudAnchor(cloudAnchorId, onSuccess, onFailure);
+    return;
+  }
+
+  if (_cloudAnchorMode == arcore::CloudAnchorMode::Disabled) {
+    pwarn("Cloud anchors are disabled, ignoring anchor resolve request");
+    return;
+  }
+  _cloudAnchorProvider->resolveCloudAnchor(cloudAnchorId, onSuccess, onFailure);
 }
 
 #pragma mark - AR Frames
 
 std::shared_ptr<VROTexture> VROARSessionARCore::getCameraBackgroundTexture() {
-    return _background;
+  return _background;
 }
 
 std::unique_ptr<VROARFrame> &VROARSessionARCore::updateFrame() {
-    _session->update(_frame);
-    _currentFrame = std::make_unique<VROARFrameARCore>(_frame, _viewport, shared_from_this());
+  _session->update(_frame);
+  _currentFrame =
+      std::make_unique<VROARFrameARCore>(_frame, _viewport, shared_from_this());
 
-    VROARFrameARCore *arFrame = (VROARFrameARCore *) _currentFrame.get();
-    processUpdatedAnchors(arFrame);
+  VROARFrameARCore *arFrame = (VROARFrameARCore *)_currentFrame.get();
+  arFrame->setDriver(_driver.lock());
+  processUpdatedAnchors(arFrame);
+  updateDepthTexture();
+  if (isSemanticModeEnabled()) {
+      updateSemanticTexture();
+  }
 
-    return _currentFrame;
+  return _currentFrame;
 }
 
 std::unique_ptr<VROARFrame> &VROARSessionARCore::getLastFrame() {
-    return _currentFrame;
+  return _currentFrame;
 }
 
 #pragma mark - Internal Methods
 
-std::shared_ptr<VROARAnchor> VROARSessionARCore::getAnchorWithId(std::string anchorId) {
-    auto it = _nativeAnchorMap.find(anchorId);
-    if (it != _nativeAnchorMap.end()) {
-        return it->second;
-    } else {
-        return nullptr;
-    }
+std::shared_ptr<VROARAnchor>
+VROARSessionARCore::getAnchorWithId(std::string anchorId) {
+  auto it = _nativeAnchorMap.find(anchorId);
+  if (it != _nativeAnchorMap.end()) {
+    return it->second;
+  } else {
+    return nullptr;
+  }
 }
 
-std::shared_ptr<VROARAnchor> VROARSessionARCore::getAnchorForNative(arcore::Anchor *anchor) {
-    std::string key = VROStringUtil::toString(anchor->getHashCode());
-    auto it = _nativeAnchorMap.find(key);
-    if (it != _nativeAnchorMap.end()) {
-        return it->second;
-    } else {
-        return nullptr;
-    }
+std::shared_ptr<VROARAnchor>
+VROARSessionARCore::getAnchorForNative(arcore::Anchor *anchor) {
+  std::string key = VROStringUtil::toString(anchor->getHashCode());
+  auto it = _nativeAnchorMap.find(key);
+  if (it != _nativeAnchorMap.end()) {
+    return it->second;
+  } else {
+    return nullptr;
+  }
 }
 
 /*
- This method does most of the ARCore processing. ARCore consists of two concepts: trackable and
- anchor. Trackables are detected real-world objects, like horizontal and vertical planes, or image
- targets. Anchors are virtual objects that are attached to the real world, either relative to a
- trackable, relative to an AR hit result, or relative to an arbitrary position.
+ This method does most of the ARCore processing. ARCore consists of two
+ concepts: trackable and anchor. Trackables are detected real-world objects,
+ like horizontal and vertical planes, or image targets. Anchors are virtual
+ objects that are attached to the real world, either relative to a trackable,
+ relative to an AR hit result, or relative to an arbitrary position.
 
- Unlike ARCore, Viro (and ARKit) merge these concepts together: trackables *are* anchors.
- In order to bridge this conceptual difference with ARCore, this method will create one ARCore anchor
- for every ARCore trackable found. It will attach that anchor to the trackable with the trackable's
- center pose.
+ Unlike ARCore, Viro (and ARKit) merge these concepts together: trackables *are*
+ anchors. In order to bridge this conceptual difference with ARCore, this method
+ will create one ARCore anchor for every ARCore trackable found. It will attach
+ that anchor to the trackable with the trackable's center pose.
 
- We then create a Viro object to correspond to each of these: a VROARAnchorARCore to correspond to
- the anchor we created for the trackable, and another VROARAnchor subclass to correspond to the
- trackable itself. For example, for planes:
+ We then create a Viro object to correspond to each of these: a
+ VROARAnchorARCore to correspond to the anchor we created for the trackable, and
+ another VROARAnchor subclass to correspond to the trackable itself. For
+ example, for planes:
 
  1. ARCore detects a new arcore::Plane
- 2. We create an arcore::Anchor attached to the plane (via arcore::Plane->acquireAnchor)
+ 2. We create an arcore::Anchor attached to the plane (via
+ arcore::Plane->acquireAnchor)
  3. We create Viro object VROARAnchorARCore to correspond to the arcore::Anchor
  4. We create Viro object VROARAnchorPlane to correspond to the arcore::Plane
- 5. We associate the VROARAnchorARCore to the VROARAnchorPlane via VRORAAnchorARCore->setTrackable()
+ 5. We associate the VROARAnchorARCore to the VROARAnchorPlane via
+ VRORAAnchorARCore->setTrackable()
  6. We place the VROARAnchorARCore in the _nativeAnchorMap and the _anchors list
 
- One point of confusion is that both anchors and trackables have their own transformation matrix.
- We use the anchor transformation matrix when determining how to place the ARNodes that we generate
- for each created Anchor. This is for compatibility with cloud anchors: the devices receiving
- the content will only have the anchor transformation.
+ One point of confusion is that both anchors and trackables have their own
+ transformation matrix. We use the anchor transformation matrix when determining
+ how to place the ARNodes that we generate for each created Anchor. This is for
+ compatibility with cloud anchors: the devices receiving the content will only
+ have the anchor transformation.
 
- All anchors found here are placed in the _nativeAnchorMap. We only place the top-level anchor in
- the map. We do not place the trackable anchors themselves in the map. For each type of anchor we
- use a different key:
+ All anchors found here are placed in the _nativeAnchorMap. We only place the
+ top-level anchor in the map. We do not place the trackable anchors themselves
+ in the map. For each type of anchor we use a different key:
 
  1. For anchors without a trackable, we key by the anchor's ID.
- 2. For plane trackables, we key by the anchor's ID *and* by the trackable's pointer address.
-    Inserting keys for both the anchor and the trackable ensures that we don't treat the anchor
-    we've created for the trackable as a brand new anchor during the next processUpdatedAnchors
-    call.
- 3. For image trackables, key by the anchor's ID *and* the image's name. Note that keying by the
-    image's name has the effect of ensuring we only recognize *one* image of a type at a time.
+ 2. For plane trackables, we key by the anchor's ID *and* by the trackable's
+ pointer address. Inserting keys for both the anchor and the trackable ensures
+ that we don't treat the anchor we've created for the trackable as a brand new
+ anchor during the next processUpdatedAnchors call.
+ 3. For image trackables, key by the anchor's ID *and* the image's name. Note
+ that keying by the image's name has the effect of ensuring we only recognize
+ *one* image of a type at a time.
 
- Finally, all anchors found are also placed in the _anchors list. As with the _nativeAnchorMap, we
- only place top-level anchors here (not the trackable anchors).
+ Finally, all anchors found are also placed in the _anchors list. As with the
+ _nativeAnchorMap, we only place top-level anchors here (not the trackable
+ anchors).
  */
 void VROARSessionARCore::processUpdatedAnchors(VROARFrameARCore *frameAR) {
-    std::shared_ptr<VROARSessionARCore> session = shared_from_this();
-    arcore::Frame *frame = frameAR->getFrameInternal();
+  std::shared_ptr<VROARSessionARCore> session = shared_from_this();
+  arcore::Frame *frame = frameAR->getFrameInternal();
 
-    arcore::AnchorList *anchorList = _session->createAnchorList();
-    frame->getUpdatedAnchors(anchorList);
-    int anchorsSize = anchorList->size();
+  arcore::AnchorList *anchorList = _session->createAnchorList();
+  frame->getUpdatedAnchors(anchorList);
+  int anchorsSize = anchorList->size();
 
-    // Find all new and updated anchors, update/create new ones and notify this class.
-    // The anchors in this list are *both* those that are tied to trackables (managed anchors)
-    // and those that were created at arbitrary world positions or in response to hit tests
-    // (manual anchors). However, we only process manual anchors here. Anchors with trackables are
-    // processed afterward as the trackables themselves are updated.
-    for (int i = 0; i < anchorsSize; i++) {
-        std::shared_ptr<arcore::Anchor> anchor = std::shared_ptr<arcore::Anchor>(anchorList->acquireItem(i));
-        std::string key = VROStringUtil::toString64(anchor->getId());
+  // Find all new and updated anchors, update/create new ones and notify this
+  // class. The anchors in this list are *both* those that are tied to
+  // trackables (managed anchors) and those that were created at arbitrary world
+  // positions or in response to hit tests (manual anchors). However, we only
+  // process manual anchors here. Anchors with trackables are processed
+  // afterward as the trackables themselves are updated.
+  for (int i = 0; i < anchorsSize; i++) {
+    std::shared_ptr<arcore::Anchor> anchor =
+        std::shared_ptr<arcore::Anchor>(anchorList->acquireItem(i));
+    std::string key = VROStringUtil::toString64(anchor->getId());
+    auto it = _nativeAnchorMap.find(key);
+
+    // Previously found anchor: update
+    if (it != _nativeAnchorMap.end()) {
+      std::shared_ptr<VROARAnchorARCore> vAnchor = it->second;
+
+      // Only update manual anchors. If the anchor has a trackable, do not
+      // process it (it will be processed with its associated trackable below)
+      if (!vAnchor->isManaged()) {
+        passert(anchor->getId() == vAnchor->getAnchorInternal()->getId());
+        vAnchor->sync();
+        updateAnchor(vAnchor);
+      } else {
+        // If the anchor is managed by a VROGeospatialAnchor (which is not an ARCore trackable),
+        // we need to manually sync it here.
+        std::shared_ptr<VROGeospatialAnchor> geoAnchor = std::dynamic_pointer_cast<VROGeospatialAnchor>(vAnchor->getTrackable());
+        if (geoAnchor) {
+            vAnchor->sync();
+            geoAnchor->updateFromGeospatialTransform(vAnchor->getTransform());
+            updateAnchor(geoAnchor);
+        }
+      }
+
+      // New or removed anchor.
+    } else {
+      arcore::TrackingState trackingState = anchor->getTrackingState();
+
+      // We have a new anchor detected by ARCore that isn't tied to a trackable.
+      // ARCore will never magically create an anchor that isn't tied to a
+      // trackable, except when acquiring new cloud anchors to host.
+      //
+      // Note we ignore anchors that are NotTracking, as this is just ARCore
+      // telling us that a managed anchor has been removed in the last frame.
+      if (trackingState != arcore::TrackingState::NotTracking) {
+        pinfo("Detected new anchor with no association (may be cloud anchor) "
+              "[%p]",
+              key.c_str());
+      }
+    }
+  }
+
+  arcore::TrackableList *planeList = _session->createTrackableList();
+  frame->getUpdatedTrackables(planeList, arcore::TrackableType::Plane);
+  int planeSize = planeList->size();
+
+  // Find all new and updated planes and process them. For new planes we will
+  // create a corresponding anchor. For updated planes we will update the planes
+  // and the anchor. Finally, we remove subsumed planes.
+  for (int i = 0; i < planeSize; i++) {
+    arcore::Trackable *trackable = planeList->acquireItem(i);
+    arcore::Plane *plane = (arcore::Plane *)trackable;
+    arcore::Plane *subsumingPlane = plane->acquireSubsumedBy();
+
+    arcore::TrackingState state = trackable->getTrackingState();
+    bool currentPlaneIsTracked = (state == arcore::TrackingState::Tracking);
+
+    // ARCore doesn't use ID for planes, but rather they simply return the same
+    // object, so the hashcodes (which in this case are pointer addresses)
+    // should be reliable
+    std::string key = getKeyForTrackable(plane);
+
+    // The plane was *NOT* subsumed by a new plane and is still tracking:
+    // either add or update it
+    if (subsumingPlane == NULL && currentPlaneIsTracked) {
+      auto it = _nativeAnchorMap.find(key);
+
+      // The plane is old: update it
+      if (it != _nativeAnchorMap.end()) {
+        std::shared_ptr<VROARAnchorARCore> vAnchor = it->second;
+
+        if (vAnchor) {
+          std::shared_ptr<VROARPlaneAnchor> vPlane =
+              std::dynamic_pointer_cast<VROARPlaneAnchor>(
+                  vAnchor->getTrackable());
+
+          // ATOMIC UPDATE: Sync plane data and anchor transform together
+          // to ensure they're never out of sync
+          syncPlaneWithARCore(vPlane, plane); // Updates plane properties
+          vAnchor->sync(); // Updates anchor transform to match ARCore anchor
+
+          // Immediately propagate to application - no delay
+          // This ensures the app sees consistent plane data + transform
+          updateAnchor(vAnchor);
+        } else {
+          pwarn("Anchor processing error: expected to find a plane");
+        }
+
+        // The plane is new: add it
+      } else {
+        pinfo("Detected new anchor tied to plane");
+
+        std::shared_ptr<VROARPlaneAnchor> vPlane =
+            std::make_shared<VROARPlaneAnchor>();
+        syncPlaneWithARCore(vPlane, plane);
+
+        // Filter out small planes (likely artifacts/noise)
+        VROVector3f extent = vPlane->getExtent();
+        float maxExtent = std::max(extent.x, extent.z);
+
+        if (maxExtent < kMinPlaneExtent) {
+          pinfo("Filtering out small plane (extent: %.3f x %.3f, threshold: %.3f)",
+                extent.x, extent.z, kMinPlaneExtent);
+          delete (trackable);
+          continue;
+        }
+
+        // PURE ANDROID FIX: Do NOT create an arcore::Anchor for the plane.
+        // Instead, we use the plane's trackable pose directly.
+        // This prevents "fighting" between the anchor pose and the plane center
+        // pose.
+        std::shared_ptr<VROARAnchorARCore> vAnchor =
+            std::make_shared<VROARAnchorARCore>(key, nullptr, vPlane, session);
+
+        // Explicitly set the transform from the plane (since sync() won't do it
+        // for null anchors)
+        vAnchor->setTransform(vPlane->getTransform());
+
+        addAnchor(vAnchor);
+      }
+
+      // The plane has been subsumed or is no longer tracked: remove it
+    } else {
+      auto it = _nativeAnchorMap.find(key);
+      if (it != _nativeAnchorMap.end()) {
+        if (subsumingPlane) {
+          pinfo("Plane %s subsumed: removing", key.c_str());
+        } else {
+          pinfo("Plane %s no longer tracked: removing", key.c_str());
+        }
+
+        std::shared_ptr<VROARAnchorARCore> vAnchor = it->second;
+        if (vAnchor) {
+          removeAnchor(vAnchor);
+        }
+      }
+      delete (subsumingPlane);
+    }
+    delete (trackable);
+  }
+
+  // Process updated/new images if the tracking implementation is ARCore. This
+  // process is virtually identical to how we handle planes above.
+  if (getImageTrackingImpl() == VROImageTrackingImpl::ARCore) {
+
+    arcore::TrackableList *imageList = _session->createTrackableList();
+    frame->getUpdatedTrackables(imageList, arcore::TrackableType::Image);
+    int imageSize = imageList->size();
+    for (int i = 0; i < imageSize; i++) {
+      arcore::Trackable *trackable = imageList->acquireItem(i);
+      arcore::AugmentedImage *image = (arcore::AugmentedImage *)trackable;
+
+      // The name of the image is used for image anchors. This enforces the
+      // condition that we only detect each image once
+      std::string key = getKeyForTrackable(image);
+
+      arcore::TrackingMethod arTrackingMethod = image->getTrackingMethod();
+      VROARImageTrackingMethod trackingMethod =
+          VROARImageTrackingMethod::NotTracking;
+      if (arTrackingMethod == arcore::TrackingMethod::Tracking) {
+        trackingMethod = VROARImageTrackingMethod::Tracking;
+      } else if (arTrackingMethod == arcore::TrackingMethod::LastKnownPose) {
+        trackingMethod = VROARImageTrackingMethod::LastKnownPose;
+      }
+
+      bool imageIsTracked =
+          (trackable->getTrackingState() == arcore::TrackingState::Tracking);
+      if (imageIsTracked) {
         auto it = _nativeAnchorMap.find(key);
 
-        // Previously found anchor: update
+        // Old image tracking target: update tracking method and imageAnchor pose.
+        // Position sync for the scene node is handled by the per-frame sync loop below,
+        // which ensures updates happen every frame regardless of getUpdatedTrackables.
         if (it != _nativeAnchorMap.end()) {
-            std::shared_ptr<VROARAnchorARCore> vAnchor = it->second;
+          std::shared_ptr<VROARAnchorARCore> vAnchor = it->second;
+          std::shared_ptr<VROARImageAnchor> imageAnchor =
+              std::dynamic_pointer_cast<VROARImageAnchor>(
+                  vAnchor->getTrackable());
 
-            // Only update manual anchors. If the anchor has a trackable, do not process it
-            // (it will be processed with its associated trackable below)
-            if (!vAnchor->isManaged()) {
-                passert (anchor->getId() == vAnchor->getAnchorInternal()->getId());
-                vAnchor->sync();
-                updateAnchor(vAnchor);
-            }
+          if (imageAnchor) {
+            imageAnchor->setTrackingMethod(trackingMethod);
+            syncImageAnchorWithARCore(imageAnchor, image);
+          } else {
+            pwarn("Anchor processing error: expected to find an image anchor");
+          }
 
-        // New or removed anchor.
+          // New image tracking target: add it
         } else {
-            arcore::TrackingState trackingState = anchor->getTrackingState();
+          std::shared_ptr<VROARImageTargetAndroid> target;
 
-            // We have a new anchor detected by ARCore that isn't tied to a trackable.
-            // ARCore will never magically create an anchor that isn't tied to a trackable,
-            // except when acquiring new cloud anchors to host.
-            //
-            // Note we ignore anchors that are NotTracking, as this is just ARCore telling us that
-            // a managed anchor has been removed in the last frame.
-            if (trackingState != arcore::TrackingState::NotTracking) {
-                pinfo("Detected new anchor with no association (may be cloud anchor) [%p]", key.c_str());
+          bool haveFoundTarget = false;
+          // first, loop over all targets to see if the target matches the found
+          // ImageAnchor
+          for (int j = 0; j < _imageTargets.size(); j++) {
+            target = std::dynamic_pointer_cast<VROARImageTargetAndroid>(
+                _imageTargets[j]);
+            if (key == target->getId()) {
+              haveFoundTarget = true;
+              // break out of the loop since we found a target id that matches
+              // the key
+              break;
             }
+          }
+          // No target found means that the AR system found an ImageAnchor w/o
+          // us knowing the target, this probably means that it was loaded from
+          // an ARImageDatabase, so lets create a new target
+          if (!haveFoundTarget) {
+            target = std::make_shared<VROARImageTargetAndroid>(key);
+          }
+
+          std::shared_ptr<VROARImageAnchor> vImage =
+              std::make_shared<VROARImageAnchor>(target, trackingMethod);
+          syncImageAnchorWithARCore(vImage, image);
+
+          // Create a new anchor to correspond with the found image
+          arcore::Pose *pose = _session->createPose();
+          image->getCenterPose(pose);
+
+          std::shared_ptr<arcore::Anchor> anchor =
+              std::shared_ptr<arcore::Anchor>(image->acquireAnchor(pose));
+          if (anchor) {
+            std::shared_ptr<VROARAnchorARCore> vAnchor =
+                std::make_shared<VROARAnchorARCore>(key, anchor, vImage,
+                                                    session);
+            vAnchor->sync();
+            addAnchor(vAnchor);
+          } else {
+            pinfo("Failed to create anchor for trackable image target: will "
+                  "try again later");
+          }
+          delete (pose);
         }
-    }
+        // The image is no longer being tracked: remove it
+      } else {
+        auto it = _nativeAnchorMap.find(key);
+        if (it != _nativeAnchorMap.end()) {
+          pinfo("Image target [%s] has lost tracking, removing", key.c_str());
 
-    arcore::TrackableList *planeList = _session->createTrackableList();
-    frame->getUpdatedTrackables(planeList, arcore::TrackableType::Plane);
-    int planeSize = planeList->size();
-
-    // Find all new and updated planes and process them. For new planes we will create a
-    // corresponding anchor. For updated planes we will update the planes and the anchor.
-    // Finally, we remove subsumed planes.
-    for (int i = 0; i < planeSize; i++) {
-        arcore::Trackable *trackable = planeList->acquireItem(i);
-        arcore::Plane * plane = (arcore::Plane *) trackable;
-        arcore::Plane * subsumingPlane = plane->acquireSubsumedBy();
-
-        arcore::TrackingState state = trackable->getTrackingState();
-        bool currentPlaneIsTracked = (state == arcore::TrackingState::Tracking);
-
-        // ARCore doesn't use ID for planes, but rather they simply return the same object, so
-        // the hashcodes (which in this case are pointer addresses) should be reliable
-        std::string key = getKeyForTrackable(plane);
-
-        // The plane was *NOT* subsumed by a new plane and is still tracking:
-        // either add or update it
-        if (subsumingPlane == NULL && currentPlaneIsTracked) {
-            auto it = _nativeAnchorMap.find(key);
-
-            // The plane is old: update it
-            if (it != _nativeAnchorMap.end()) {
-                std::shared_ptr<VROARAnchorARCore> vAnchor = it->second;
-
-                if (vAnchor) {
-                    std::shared_ptr<VROARPlaneAnchor> vPlane = std::dynamic_pointer_cast<VROARPlaneAnchor>(
-                            vAnchor->getTrackable());
-                    syncPlaneWithARCore(vPlane, plane);
-                    vAnchor->sync();
-                    updateAnchor(vAnchor);
-                } else {
-                    pwarn("Anchor processing error: expected to find a plane");
-                }
-
-            // The plane is new: add it
-            } else {
-                pinfo("Detected new anchor tied to plane");
-
-                std::shared_ptr<VROARPlaneAnchor> vPlane = std::make_shared<VROARPlaneAnchor>();
-                syncPlaneWithARCore(vPlane, plane);
-
-                // Create a new anchor to correspond with the found plane
-                arcore::Pose *pose = _session->createPose();
-                plane->getCenterPose(pose);
-                std::shared_ptr<arcore::Anchor> anchor = std::shared_ptr<arcore::Anchor>(plane->acquireAnchor(pose));
-
-                // If the anchor could not be created, just continue. We'll try again when this trackable
-                // is update next frame
-                if (anchor) {
-                    std::shared_ptr<VROARAnchorARCore> vAnchor = std::make_shared<VROARAnchorARCore>(key, anchor, vPlane, session);
-                    vAnchor->sync();
-                    addAnchor(vAnchor);
-                } else {
-                    pinfo("Failed to create anchor for trackable plane: will try again later");
-                }
-                delete (pose);
-            }
-
-        // The plane has been subsumed or is no longer tracked: remove it
-        } else {
-            auto it = _nativeAnchorMap.find(key);
-            if (it != _nativeAnchorMap.end()) {
-                if (subsumingPlane) {
-                    pinfo("Plane %s subsumed: removing", key.c_str());
-                } else {
-                    pinfo("Plane %s no longer tracked: removing", key.c_str());
-                }
-
-                std::shared_ptr<VROARAnchorARCore> vAnchor = it->second;
-                if (vAnchor) {
-                    removeAnchor(vAnchor);
-                }
-            }
-            delete (subsumingPlane);
+          std::shared_ptr<VROARAnchorARCore> vAnchor = it->second;
+          if (vAnchor) {
+            removeAnchor(vAnchor);
+          }
         }
-        delete (trackable);
+      }
     }
+    delete (imageList);
 
-    // Process updated/new images if the tracking implementation is ARCore. This process
-    // is virtually identical to how we handle planes above.
-    if (getImageTrackingImpl() == VROImageTrackingImpl::ARCore) {
-
-        arcore::TrackableList *imageList = _session->createTrackableList();
-        frame->getUpdatedTrackables(imageList, arcore::TrackableType::Image);
-        int imageSize = imageList->size();
-
-        for (int i = 0; i < imageSize; i++) {
-            arcore::Trackable *trackable = imageList->acquireItem(i);
-            arcore::AugmentedImage *image = (arcore::AugmentedImage *) trackable;
-
-            // The name of the image is used for image anchors. This enforces the condition
-            // that we only detect each image once
-            std::string key = getKeyForTrackable(image);
-
-            arcore::TrackingMethod arTrackingMethod = image->getTrackingMethod();
-            VROARImageTrackingMethod trackingMethod = VROARImageTrackingMethod::NotTracking;
-            if (arTrackingMethod == arcore::TrackingMethod::Tracking) {
-                trackingMethod = VROARImageTrackingMethod::Tracking;
-            } else if (arTrackingMethod == arcore::TrackingMethod::LastKnownPose) {
-                trackingMethod = VROARImageTrackingMethod::LastKnownPose;
-            }
-
-            bool imageIsTracked = (trackable->getTrackingState() == arcore::TrackingState::Tracking);
-            if (imageIsTracked) {
-                auto it = _nativeAnchorMap.find(key);
-
-                // Old image tracking target: update it
-                if (it != _nativeAnchorMap.end()) {
-                    std::shared_ptr<VROARAnchorARCore> vAnchor = it->second;
-                    std::shared_ptr<VROARImageAnchor> imageAnchor = std::dynamic_pointer_cast<VROARImageAnchor>(
-                            vAnchor->getTrackable());
-
-                    if (vAnchor) {
-                        imageAnchor->setTrackingMethod(trackingMethod);
-                        syncImageAnchorWithARCore(imageAnchor, image);
-                        vAnchor->sync();
-                        updateAnchor(vAnchor);
-                    } else {
-                        pwarn("Anchor processing error: expected to find an image anchor");
-                    }
-
-                // New image tracking target: add it
-                } else {
-                    std::shared_ptr<VROARImageTargetAndroid> target;
-
-                    bool haveFoundTarget = false;
-                    // first, loop over all targets to see if the target matches the found ImageAnchor
-                    for (int j = 0; j < _imageTargets.size(); j++) {
-                        target = std::dynamic_pointer_cast<VROARImageTargetAndroid>(_imageTargets[j]);
-                        if (key == target->getId()) {
-                            pinfo("Detected new anchor tied to image target [%s]", key.c_str());
-                            haveFoundTarget = true;
-                            // break out of the loop since we found a target id that matches the key
-                            break;
-                        }
-                    }
-                    // No target found means that the AR system found an ImageAnchor w/o us knowing
-                    // the target, this probably means that it was loaded from an ARImageDatabase, so
-                    // lets create a new target
-                    if (!haveFoundTarget) {
-                        target = std::make_shared<VROARImageTargetAndroid>(key);
-                    }
-
-                    std::shared_ptr<VROARImageAnchor> vImage = std::make_shared<VROARImageAnchor>(
-                            target, trackingMethod);
-                    syncImageAnchorWithARCore(vImage, image);
-
-                    // Create a new anchor to correspond with the found image
-                    arcore::Pose *pose = _session->createPose();
-                    image->getCenterPose(pose);
-
-                    std::shared_ptr<arcore::Anchor> anchor = std::shared_ptr<arcore::Anchor>(
-                            image->acquireAnchor(pose));
-                    if (anchor) {
-                        std::shared_ptr<VROARAnchorARCore> vAnchor = std::make_shared<VROARAnchorARCore>(
-                                key, anchor, vImage, session);
-                        vAnchor->sync();
-                        addAnchor(vAnchor);
-                    } else {
-                        pinfo("Failed to create anchor for trackable image target: will try again later");
-                    }
-                    delete (pose);
-                }
-            // The image is no longer being tracked: remove it
-            } else {
-                auto it = _nativeAnchorMap.find(key);
-                if (it != _nativeAnchorMap.end()) {
-                    pinfo("Image target [%s] has lost tracking, removing", key.c_str());
-
-                    std::shared_ptr<VROARAnchorARCore> vAnchor = it->second;
-                    if (vAnchor) {
-                        removeAnchor(vAnchor);
-                    }
-                }
-            }
-        }
-        delete (imageList);
+    // Per-frame position sync for all active image anchors.
+    //
+    // ARCore updates the ArAnchor pose on every ArSession_update() for anchors attached to
+    // trackables — regardless of whether the image appears in getUpdatedTrackables() that
+    // frame. By syncing here we guarantee the scene node is always at the current world-space
+    // pose of the image, not just on frames where ARCore happens to report the trackable as
+    // "updated".
+    for (auto& entry : _nativeAnchorMap) {
+      std::shared_ptr<VROARAnchorARCore> vAnchor = entry.second;
+      if (!vAnchor || !vAnchor->isManaged() || !vAnchor->getARNode()) {
+        continue;
+      }
+      std::shared_ptr<VROARImageAnchor> imageAnchor =
+          std::dynamic_pointer_cast<VROARImageAnchor>(vAnchor->getTrackable());
+      if (!imageAnchor) {
+        continue;
+      }
+      vAnchor->sync();
+      updateAnchor(vAnchor);
     }
+  }
 
-    delete (anchorList);
-    delete (planeList);
+  delete (anchorList);
+  delete (planeList);
 }
 
-std::string VROARSessionARCore::getKeyForTrackable(arcore::Trackable *trackable) {
-    arcore::TrackableType type = trackable->getType();
-    if (type == arcore::TrackableType::Plane) {
-        arcore::Plane *plane = (arcore::Plane *) trackable;
-        return VROStringUtil::toString(plane->getHashCode());
-    }
-    else if (type == arcore::TrackableType::Image) {
-        arcore::AugmentedImage *image = (arcore::AugmentedImage *) trackable;
-        return std::string(image->getName());
-    }
-    else {
-        pwarn("Attempting to get key for invalid trackable type");
-        return "";
-    }
+std::string
+VROARSessionARCore::getKeyForTrackable(arcore::Trackable *trackable) {
+  arcore::TrackableType type = trackable->getType();
+  if (type == arcore::TrackableType::Plane) {
+    arcore::Plane *plane = (arcore::Plane *)trackable;
+    return VROStringUtil::toString(plane->getHashCode());
+  } else if (type == arcore::TrackableType::Image) {
+    arcore::AugmentedImage *image = (arcore::AugmentedImage *)trackable;
+    return std::string(image->getName());
+  } else {
+    pwarn("Attempting to get key for invalid trackable type");
+    return "";
+  }
 }
 
-std::shared_ptr<VROARAnchorARCore> VROARSessionARCore::getAnchorForTrackable(arcore::Trackable *trackable) {
-    std::string key = getKeyForTrackable(trackable);
-    if (key.empty()) {
-        return nullptr;
-    }
-    auto it = _nativeAnchorMap.find(key);
-    if (it == _nativeAnchorMap.end()) {
-        return nullptr;
-    }
-    return it->second;
+std::shared_ptr<VROARAnchorARCore>
+VROARSessionARCore::getAnchorForTrackable(arcore::Trackable *trackable) {
+  std::string key = getKeyForTrackable(trackable);
+  if (key.empty()) {
+    return nullptr;
+  }
+  auto it = _nativeAnchorMap.find(key);
+  if (it == _nativeAnchorMap.end()) {
+    return nullptr;
+  }
+  return it->second;
 }
 
-void VROARSessionARCore::syncPlaneWithARCore(std::shared_ptr<VROARPlaneAnchor> plane,
-                                             arcore::Plane *planeAR) {
-    arcore::Pose *pose = _session->createPose();
-    planeAR->getCenterPose(pose);
+void VROARSessionARCore::syncPlaneWithARCore(
+    std::shared_ptr<VROARPlaneAnchor> plane, arcore::Plane *planeAR) {
+  // Get the plane's center pose directly from ARCore
+  // In ARCore, the anchor is created AT the plane's center, so we use
+  // the center pose as the anchor transform directly
+  arcore::Pose *centerPose = _session->createPose();
+  planeAR->getCenterPose(centerPose);
 
-    float newTransformMtx[16];
-    pose->toMatrix(newTransformMtx);
-    VROMatrix4f newTransform(newTransformMtx);
-    VROVector3f newTranslation = newTransform.extractTranslation();
+  float transformMtx[16];
+  centerPose->toMatrix(transformMtx);
 
-    VROMatrix4f oldTransform = plane->getTransform();
-    VROVector3f oldTranslation = oldTransform.extractTranslation();
+  VROMatrix4f transform(transformMtx);
 
-    // Update our plane's transform if it has been previously set.
-    if (!oldTranslation.isEqual(VROVector3f())) {
-        // Calculate our new center.
-        VROVector3f offsetRelativeToPlane = newTranslation - oldTranslation;
-        VROVector3f localCenter = VROVector3f(offsetRelativeToPlane.x, 0.0f, offsetRelativeToPlane.z);
-        plane->setCenter(localCenter);
+  // CRITICAL: Set transform on VROARPlaneAnchor because that's what the app
+  // uses! In Android's dual-anchor architecture, the app gets the
+  // VROARPlaneAnchor via getAnchorForTrackable(), so it needs the transform. We
+  // use the plane's current center pose directly, which updates as the plane
+  // grows.
+  plane->setTransform(transform);
 
-        // Calculate the plane's new transform.
-        newTransform.translate(localCenter.scale(-1.0));
+  // Fix for Regression: Set center to (0,0,0) (Local Coordinates)
+  // Since we just set the anchor's transform to be the plane's center pose
+  // (above), the plane's center relative to the anchor is the origin.
+  // Previously, this was set to 'worldCenter', causing a double-transformation
+  // when the app added WorldPosition (Anchor) + WorldPosition (Center).
+  plane->setCenter(VROVector3f(0, 0, 0));
+
+  delete (centerPose);
+
+  // Update alignment directly from ARCore
+  switch (planeAR->getPlaneType()) {
+  case arcore::PlaneType::HorizontalUpward:
+    plane->setAlignment(VROARPlaneAlignment::HorizontalUpward);
+    break;
+  case arcore::PlaneType::HorizontalDownward:
+    plane->setAlignment(VROARPlaneAlignment::HorizontalDownward);
+    break;
+  case arcore::PlaneType::Vertical:
+    plane->setAlignment(VROARPlaneAlignment::Vertical);
+    break;
+  default:
+    plane->setAlignment(VROARPlaneAlignment::Horizontal);
+  }
+
+  // Update extent directly from ARCore
+  float extentX = planeAR->getExtentX();
+  float extentZ = planeAR->getExtentZ();
+  plane->setExtent(VROVector3f(extentX, 0, extentZ));
+
+  // Update boundary vertices directly from ARCore
+  // ARCore provides polygon vertices in plane-local space (relative to center)
+  std::vector<VROVector3f> boundaryVertices;
+  float *polygonArray = planeAR->getPolygon();
+  int polygonArraySize = planeAR->getPolygonSize();
+
+  if (polygonArraySize > 0) {
+    // Reserve space to avoid reallocations
+    boundaryVertices.reserve(polygonArraySize / 2);
+
+    // ARCore polygon is 2D (X, Z pairs), parse directly
+    // Vertices are already in plane-local space relative to center
+    for (int i = 0; i < polygonArraySize; i = i + 2) {
+      VROVector3f vertex;
+      vertex.x = polygonArray[i];
+      vertex.y = 0; // ARCore polygons are 2D
+      vertex.z = polygonArray[i + 1];
+      boundaryVertices.push_back(vertex);
     }
 
-    plane->setTransform(newTransform);
+    delete[] polygonArray;
+  }
+  plane->setBoundaryVertices(std::move(boundaryVertices));
 
-    switch (planeAR->getPlaneType()) {
-        case arcore::PlaneType::HorizontalUpward :
-            plane->setAlignment(VROARPlaneAlignment::HorizontalUpward);
-            break;
-        case arcore::PlaneType::HorizontalDownward :
-            plane->setAlignment(VROARPlaneAlignment::HorizontalDownward);
-            break;
-        case arcore::PlaneType ::Vertical :
-            plane->setAlignment(VROARPlaneAlignment::Vertical);
-            break;
-        default:
-            plane->setAlignment(VROARPlaneAlignment::Horizontal);
-    }
+  // Infer basic plane classification from PlaneType
+  // Note: ARCore's semantic labels are not exposed in this API wrapper,
+  // so we use heuristics based on plane orientation
+  VROARPlaneClassification classification = VROARPlaneClassification::Unknown;
+  switch (planeAR->getPlaneType()) {
+  case arcore::PlaneType::HorizontalUpward:
+    // Upward-facing horizontal planes are typically floors/ground
+    classification = VROARPlaneClassification::Floor;
+    break;
+  case arcore::PlaneType::HorizontalDownward:
+    // Downward-facing horizontal planes are typically ceilings
+    classification = VROARPlaneClassification::Ceiling;
+    break;
+  case arcore::PlaneType::Vertical:
+    // Vertical planes are typically walls (could also be doors/windows but we
+    // can't distinguish)
+    classification = VROARPlaneClassification::Wall;
+    break;
+  default:
+    classification = VROARPlaneClassification::Unknown;
+    break;
+  }
+  plane->setClassification(classification);
 
-    float extentX = planeAR->getExtentX();
-    float extentZ = planeAR->getExtentZ();
-    plane->setExtent(VROVector3f(extentX, 0, extentZ));
+  // Record that an update occurred (for diagnostics)
+  plane->recordUpdate(true);
 
-    delete (pose);
+#ifdef VRO_PLANE_PRECISION_DEBUG_LOGGING
+  // PRECISION VALIDATION: Log comparison between ARCore raw data and ViroCore
+  // processed data This helps validate that we're preserving native precision
+  // WARNING: This logging happens on EVERY plane update and can severely impact
+  // performance! Only enable for debugging precision issues.
+  VROVector3f viroCenter = plane->getCenter();
+  VROVector3f viroExtent = plane->getExtent();
+  VROVector3f arcoreWorldCenter = transform.extractTranslation();
+  VROMatrix4f viroTransform = plane->getTransform();
+  VROVector3f viroTransformPosition = viroTransform.extractTranslation();
 
-    // Grab the polygon points from ARCore,
-    std::vector<VROVector3f> boundaryVertices;
-    float* polygonArray = planeAR->getPolygon();
-    int polygonArraySize = planeAR->getPolygonSize();
-
-    if (polygonArraySize > 0) {
-        // Parse out polygons from the shape.
-        for (int i = 0; i < polygonArraySize; i = i + 2) {
-            VROVector3f newPoint;
-            newPoint.x = polygonArray[i];
-            newPoint.y = 0;
-            newPoint.z = polygonArray[i+1];
-            boundaryVertices.push_back(newPoint);
-        }
-
-        delete [] polygonArray;
-    }
-
-    plane->setBoundaryVertices(boundaryVertices);
+  pinfo("ARCore Plane Precision Check:");
+  pinfo("  ARCore center pose (world): (%.6f, %.6f, %.6f)", arcoreWorldCenter.x,
+        arcoreWorldCenter.y, arcoreWorldCenter.z);
+  pinfo("  ViroCore plane.center (world): (%.6f, %.6f, %.6f) [should match "
+        "ARCore]",
+        viroCenter.x, viroCenter.y, viroCenter.z);
+  pinfo("  ViroCore plane.transform position: (%.6f, %.6f, %.6f) [should match "
+        "center]",
+        viroTransformPosition.x, viroTransformPosition.y,
+        viroTransformPosition.z);
+  pinfo("  ARCore extent: %.6f x %.6f", extentX, extentZ);
+  pinfo("  ViroCore extent: (%.6f, %.6f, %.6f)", viroExtent.x, viroExtent.y,
+        viroExtent.z);
+  pinfo("  Boundary vertices: %d", (int)boundaryVertices.size());
+#endif
 }
 
-void VROARSessionARCore::syncImageAnchorWithARCore(std::shared_ptr<VROARImageAnchor> imageAnchor,
-                                                   arcore::AugmentedImage *imageAR) {
-    arcore::Pose *pose = _session->createPose();
-    imageAR->getCenterPose(pose);
+void VROARSessionARCore::syncImageAnchorWithARCore(
+    std::shared_ptr<VROARImageAnchor> imageAnchor,
+    arcore::AugmentedImage *imageAR) {
+  arcore::Pose *pose = _session->createPose();
+  imageAR->getCenterPose(pose);
 
-    float newTransformMtx[16];
-    pose->toMatrix(newTransformMtx);
-    VROMatrix4f newTransform(newTransformMtx);
-    imageAnchor->setTransform(newTransform);
+  float newTransformMtx[16];
+  pose->toMatrix(newTransformMtx);
+  VROMatrix4f newTransform(newTransformMtx);
+  imageAnchor->setTransform(newTransform);
 
-    delete (pose);
+  delete (pose);
 }
 
 uint8_t *VROARSessionARCore::getRotatedCameraImageData(int size) {
-    if (_rotatedImageData == nullptr || _rotatedImageDataLength != size) {
-        free (_rotatedImageData);
-        _rotatedImageData = (uint8_t *) malloc(size);
-        _rotatedImageDataLength = size;
+  if (_rotatedImageData == nullptr || _rotatedImageDataLength != size) {
+    free(_rotatedImageData);
+    _rotatedImageData = (uint8_t *)malloc(size);
+    _rotatedImageDataLength = size;
+  }
+  return _rotatedImageData;
+}
+
+#pragma mark - Occlusion Support
+
+void VROARSessionARCore::setOcclusionMode(VROOcclusionMode mode) {
+  // Call base class to store the mode
+  VROARSession::setOcclusionMode(mode);
+
+  // Update ARCore depth mode based on occlusion mode
+  arcore::DepthMode newDepthMode;
+  switch (mode) {
+    case VROOcclusionMode::DepthBased:
+    case VROOcclusionMode::PeopleOnly:
+    case VROOcclusionMode::DepthOnly:
+      // Enable automatic depth for occlusion or depth-only mode
+      newDepthMode = arcore::DepthMode::Automatic;
+      break;
+    case VROOcclusionMode::Disabled:
+    default:
+      // Disable depth when occlusion is disabled
+      newDepthMode = arcore::DepthMode::Disabled;
+      break;
+  }
+
+  if (newDepthMode != _depthMode) {
+    _depthMode = newDepthMode;
+
+    // Only update config if session is ready
+    if (_session != nullptr) {
+      updateARCoreConfig();
+      pinfo("VROARSessionARCore: Occlusion mode set to %d, depth mode set to %d",
+            (int)mode, (int)_depthMode);
+    } else {
+      pinfo("VROARSessionARCore: Occlusion mode will be applied when session is ready (mode=%d, depth=%d)",
+            (int)mode, (int)_depthMode);
     }
-    return _rotatedImageData;
+  }
+}
+
+bool VROARSessionARCore::isOcclusionSupported() const {
+  if (_session == nullptr) {
+    return false;
+  }
+  // Check if automatic depth mode is supported
+  return _session->isDepthModeSupported(arcore::DepthMode::Automatic);
+}
+
+bool VROARSessionARCore::isOcclusionModeSupported(VROOcclusionMode mode) const {
+  if (_session == nullptr) {
+    return mode == VROOcclusionMode::Disabled;
+  }
+
+  switch (mode) {
+    case VROOcclusionMode::Disabled:
+      return true;
+    case VROOcclusionMode::DepthBased:
+    case VROOcclusionMode::DepthOnly:
+      return _session->isDepthModeSupported(arcore::DepthMode::Automatic);
+    case VROOcclusionMode::PeopleOnly:
+      // People-only occlusion requires both depth and semantic segmentation
+      return _session->isDepthModeSupported(arcore::DepthMode::Automatic) &&
+             _session->isSemanticModeSupported(arcore::SemanticMode::Enabled);
+    default:
+      return false;
+  }
+}
+
+#pragma mark - Geospatial API
+
+bool VROARSessionARCore::isGeospatialModeSupported() const {
+    if (!_session) return false;
+    return _session->isGeospatialModeSupported(arcore::GeospatialMode::Enabled);
+}
+
+void VROARSessionARCore::setGeospatialModeEnabled(bool enabled) {
+    if (!_session) return;
+
+    arcore::GeospatialMode newMode = enabled ? arcore::GeospatialMode::Enabled : arcore::GeospatialMode::Disabled;
+
+    // Avoid unnecessary reconfiguration if mode hasn't changed
+    // This prevents VIO reset loops when setGeospatialModeEnabled is called repeatedly
+    if (_geospatialMode == newMode) {
+        return;
+    }
+
+    _geospatialMode = newMode;
+    updateARCoreConfig();
+}
+
+void VROARSessionARCore::setGeospatialAnchorProvider(VROGeospatialAnchorProvider provider) {
+    VROARSession::setGeospatialAnchorProvider(provider);
+
+    if (provider == VROGeospatialAnchorProvider::ReactVision) {
+        // ReactVision has no ARCore dependency — no VPS, no ARCore session config.
+        // GPS→AR placement uses createLocalGPSAnchor; backend persistence via createAnchor.
+        // _geospatialProviderRV is initialized in setReactVisionConfig().
+        if (!_geospatialProviderRV) {
+            pwarn("VROARSessionARCore: ReactVision geospatial not ready — "
+                  "setReactVisionConfig() must be called first.");
+        }
+        return;
+    } else {
+        // Switching away from ReactVision — tear down the provider
+#if RVCCA_AVAILABLE
+        _geospatialProviderRV.reset();
+#endif
+    }
+}
+
+VROEarthTrackingState VROARSessionARCore::getEarthTrackingState() const {
+#if RVCCA_AVAILABLE
+    if (getGeospatialAnchorProvider() == VROGeospatialAnchorProvider::ReactVision) {
+        return _geospatialProviderRV ? VROEarthTrackingState::Tracking
+                                     : VROEarthTrackingState::Stopped;
+    }
+#endif
+    if (!_session) return VROEarthTrackingState::Stopped;
+
+    arcore::TrackingState state = _session->getEarthTrackingState();
+    switch (state) {
+        case arcore::TrackingState::Tracking:
+            return VROEarthTrackingState::Tracking;
+        case arcore::TrackingState::Paused:
+            return VROEarthTrackingState::Paused;
+        case arcore::TrackingState::Stopped:
+        default:
+            return VROEarthTrackingState::Stopped;
+    }
+}
+
+VROGeospatialPose VROARSessionARCore::getCameraGeospatialPose() const {
+#if RVCCA_AVAILABLE
+    if (getGeospatialAnchorProvider() == VROGeospatialAnchorProvider::ReactVision) {
+        return _lastKnownGPSPose;
+    }
+#endif
+    VROGeospatialPose result;
+    if (!_session) return result;
+
+    arcore::GeospatialPoseData poseData;
+    if (_session->getCameraGeospatialPose(&poseData)) {
+        result.latitude              = poseData.latitude;
+        result.longitude             = poseData.longitude;
+        result.altitude              = poseData.altitude;
+        result.heading               = poseData.heading;
+        result.horizontalAccuracy    = poseData.horizontalAccuracy;
+        result.verticalAccuracy      = poseData.verticalAccuracy;
+        result.orientationYawAccuracy = poseData.orientationYawAccuracy;
+        result.quaternion            = VROQuaternion(poseData.quaternion[0],
+                                                     poseData.quaternion[1],
+                                                     poseData.quaternion[2],
+                                                     poseData.quaternion[3]);
+    }
+    return result;
+}
+
+void VROARSessionARCore::setLastKnownLocation(double lat, double lng, double alt,
+                                              double horizAcc, double vertAcc,
+                                              double heading, double headingAcc) {
+    _lastKnownGPSPose.latitude           = lat;
+    _lastKnownGPSPose.longitude          = lng;
+    _lastKnownGPSPose.altitude           = alt;
+    _lastKnownGPSPose.horizontalAccuracy = horizAcc;
+    _lastKnownGPSPose.verticalAccuracy   = vertAcc;
+    _lastKnownGPSPose.heading            = heading;
+    _lastKnownGPSPose.headingAccuracy    = headingAcc;
+    // Build yaw quaternion in EUS frame (rotation around Y by heading radians)
+    double yaw = heading * M_PI / 180.0;
+    _lastKnownGPSPose.quaternion = VROQuaternion(0.0f,
+                                                 (float)std::sin(yaw / 2.0),
+                                                 0.0f,
+                                                 (float)std::cos(yaw / 2.0));
+}
+
+// Improvement 3: read back the last GPS fix stored by setLastKnownLocation().
+// Called from VROCloudAnchorProviderReactVision::hostCloudAnchor() to populate
+// host request metadata with real coordinates.
+void VROARSessionARCore::getLastKnownLocation(double& lat, double& lng, double& alt) const {
+    lat = _lastKnownGPSPose.latitude;
+    lng = _lastKnownGPSPose.longitude;
+    alt = _lastKnownGPSPose.altitude;
+}
+
+void VROARSessionARCore::checkVPSAvailability(double latitude, double longitude,
+                                              std::function<void(VROVPSAvailability)> callback) {
+#if RVCCA_AVAILABLE
+    if (getGeospatialAnchorProvider() == VROGeospatialAnchorProvider::ReactVision) {
+        // ReactVision doesn't have a VPS concept; report Available when provider is ready
+        if (callback) callback(_geospatialProviderRV
+                               ? VROVPSAvailability::Available
+                               : VROVPSAvailability::Unknown);
+        return;
+    }
+#endif
+    if (!_session) {
+        if (callback) callback(VROVPSAvailability::Unknown);
+        return;
+    }
+
+    _session->checkVpsAvailability(latitude, longitude, [callback](arcore::VPSAvailability availability) {
+        VROVPSAvailability result;
+        switch (availability) {
+            case arcore::VPSAvailability::Available:
+                result = VROVPSAvailability::Available;
+                break;
+            case arcore::VPSAvailability::Unavailable:
+                result = VROVPSAvailability::Unavailable;
+                break;
+            case arcore::VPSAvailability::ErrorNetwork:
+                result = VROVPSAvailability::ErrorNetwork;
+                break;
+            case arcore::VPSAvailability::ErrorResourceExhausted:
+                result = VROVPSAvailability::ErrorResourceExhausted;
+                break;
+            case arcore::VPSAvailability::ErrorInternal:
+            case arcore::VPSAvailability::Unknown:
+            default:
+                result = VROVPSAvailability::Unknown;
+                break;
+        }
+        if (callback) callback(result);
+    });
+}
+
+// Create a local ARCore anchor at the GPS-computed world position using
+// acquireNewAnchor. No VPS required — placed by GPS + compass + VIO.
+// AR placement math is delegated to RVCCAGeospatialProvider::computeArPosition()
+// (proprietary algorithm inside libreactvisioncca — not exposed in open-source virocore).
+#if RVCCA_AVAILABLE
+static std::shared_ptr<VROGeospatialAnchor> createLocalGPSAnchor(
+    arcore::Session *session,
+    const VROGeospatialPose &devicePose,
+    double anchorLat, double anchorLng, double anchorAlt,
+    VROGeospatialAnchorType type, VROQuaternion quaternion,
+    std::shared_ptr<VROARSessionARCore> arSession,
+    ReactVisionCCA::RVCCAGeospatialProvider *provider,
+    std::string &outError,
+    const std::string &knownId = "") {
+    if (devicePose.latitude == 0.0 && devicePose.longitude == 0.0) {
+        outError = "GPS position not available yet. Ensure location permissions are granted.";
+        return nullptr;
+    }
+    auto pos = provider->computeArPosition(
+        devicePose.latitude, devicePose.longitude, devicePose.altitude, devicePose.heading,
+        anchorLat, anchorLng, anchorAlt);
+    float arX = pos[0], arY = pos[1], arZ = pos[2];
+
+    arcore::Pose *pose = session->createPose(arX, arY, arZ,
+                                             quaternion.X, quaternion.Y, quaternion.Z, quaternion.W);
+    arcore::Anchor *nativeAnchor = session->acquireNewAnchor(pose);
+    delete pose;
+
+    if (!nativeAnchor) {
+        outError = "Failed to create local anchor at GPS position.";
+        return nullptr;
+    }
+    std::shared_ptr<arcore::Anchor> anchorShared(nativeAnchor);
+    std::string key = VROStringUtil::toString64(anchorShared->getId());
+    std::string uuid = knownId.empty() ? generateUUID() : knownId;
+
+    auto geoAnchor = std::make_shared<VROGeospatialAnchor>(type, anchorLat, anchorLng, anchorAlt, quaternion);
+    geoAnchor->setId(uuid);
+    geoAnchor->setResolveState(VROGeospatialAnchorResolveState::Success);
+
+    // Set the AR-space transform immediately so the onSuccess callback gets the correct position.
+    // (processUpdatedAnchors will keep it in sync each frame via updateFromGeospatialTransform.)
+    float mtx[16];
+    nativeAnchor->getTransform(mtx);
+    geoAnchor->setTransform(VROMatrix4f(mtx));
+
+    auto vAnchor = std::make_shared<VROARAnchorARCore>(uuid, anchorShared, geoAnchor, arSession);
+    arSession->addAnchor(vAnchor);
+    return geoAnchor;
+}
+#endif // RVCCA_AVAILABLE
+
+void VROARSessionARCore::createGeospatialAnchor(double latitude, double longitude, double altitude,
+                                                VROQuaternion quaternion,
+                                                std::function<void(std::shared_ptr<VROGeospatialAnchor>)> onSuccess,
+                                                std::function<void(std::string error)> onFailure) {
+#if RVCCA_AVAILABLE
+    if (getGeospatialAnchorProvider() == VROGeospatialAnchorProvider::ReactVision) {
+        std::string error;
+        auto anchor = createLocalGPSAnchor(_session, _lastKnownGPSPose,
+                                           latitude, longitude, altitude,
+                                           VROGeospatialAnchorType::WGS84, quaternion,
+                                           shared_from_this(), _geospatialProviderRV.get(),
+                                           error);
+        if (anchor) { if (onSuccess) onSuccess(anchor); }
+        else         { if (onFailure) onFailure(error);  }
+        return;
+    }
+#endif
+    if (_geospatialMode == arcore::GeospatialMode::Disabled) {
+        if (onFailure) onFailure("Geospatial mode is disabled");
+        return;
+    }
+
+    // Native takes double lat, double lon, double alt, float* rotation (4 floats)
+    float rot[4] = {quaternion.X, quaternion.Y, quaternion.Z, quaternion.W};
+    
+    arcore::Anchor *nativeAnchor = _session->createGeospatialAnchor(latitude, longitude, altitude, rot[0], rot[1], rot[2], rot[3]);
+    
+    if (nativeAnchor) {
+        std::shared_ptr<arcore::Anchor> anchorShared(nativeAnchor);
+        std::string key = VROStringUtil::toString64(anchorShared->getId());
+
+        // Create VROGeospatialAnchor with the same ID as the native anchor
+        std::shared_ptr<VROGeospatialAnchor> geoAnchor = std::make_shared<VROGeospatialAnchor>(
+            VROGeospatialAnchorType::WGS84, latitude, longitude, altitude, quaternion);
+        geoAnchor->setId(key);
+
+        // Create VROARAnchorARCore
+        // We use the geoAnchor as the "trackable" so we can retrieve it in processUpdatedAnchors
+        std::shared_ptr<VROARAnchorARCore> vAnchor = std::make_shared<VROARAnchorARCore>(
+            key, anchorShared, geoAnchor, shared_from_this());
+
+        // Add to maps
+        addAnchor(vAnchor);
+
+        // Invoke callback
+        if (onSuccess) onSuccess(geoAnchor);
+    } else {
+        if (onFailure) onFailure("Failed to create geospatial anchor");
+    }
+}
+
+void VROARSessionARCore::resolveGeospatialAnchor(const std::string& platformUuid,
+                                                  VROQuaternion quaternion,
+                                                  std::function<void(std::shared_ptr<VROGeospatialAnchor>)> onSuccess,
+                                                  std::function<void(std::string error)> onFailure) {
+#if RVCCA_AVAILABLE
+    if (getGeospatialAnchorProvider() == VROGeospatialAnchorProvider::ReactVision) {
+        if (!_geospatialProviderRV) {
+            if (onFailure) onFailure("ReactVision geospatial provider not initialized");
+            return;
+        }
+        if (_lastKnownGPSPose.latitude == 0.0 && _lastKnownGPSPose.longitude == 0.0) {
+            if (onFailure) onFailure("GPS position not available yet. Ensure location permissions are granted.");
+            return;
+        }
+        VROGeospatialPose devicePose = _lastKnownGPSPose;
+        std::weak_ptr<VROARSessionARCore> weakSelf = shared_from_this();
+        _geospatialProviderRV->getAnchor(platformUuid,
+            [weakSelf, devicePose, platformUuid, quaternion, onSuccess, onFailure]
+            (ReactVisionCCA::ApiResult<ReactVisionCCA::GeospatialAnchorRecord> r) {
+                VROPlatformDispatchAsyncRenderer([weakSelf, r, devicePose, platformUuid, quaternion, onSuccess, onFailure] {
+                    auto self = weakSelf.lock();
+                    if (!self) return;
+                    if (!r.success) {
+                        if (onFailure) onFailure(r.error.message);
+                        return;
+                    }
+                    std::string error;
+                    auto anchor = createLocalGPSAnchor(self->_session, devicePose,
+                                                       r.data.lat, r.data.lng, r.data.alt,
+                                                       VROGeospatialAnchorType::WGS84, quaternion,
+                                                       self, self->_geospatialProviderRV.get(),
+                                                       error, platformUuid);
+                    if (anchor) { if (onSuccess) onSuccess(anchor); }
+                    else        { if (onFailure) onFailure(error);  }
+                });
+            });
+        return;
+    }
+#endif
+    if (onFailure) onFailure("resolveGeospatialAnchor requires ReactVision geospatial provider");
+}
+
+void VROARSessionARCore::hostGeospatialAnchor(double latitude, double longitude, double altitude,
+                                              const std::string& altitudeMode,
+                                              std::function<void(std::string)> onSuccess,
+                                              std::function<void(std::string)> onFailure) {
+#if RVCCA_AVAILABLE
+    if (getGeospatialAnchorProvider() == VROGeospatialAnchorProvider::ReactVision) {
+        if (!_geospatialProviderRV) {
+            if (onFailure) onFailure("ReactVision geospatial provider not initialized");
+            return;
+        }
+        ReactVisionCCA::GeospatialCreateRequest req;
+        req.lat = latitude;
+        req.lng = longitude;
+        req.alt = altitude;
+        req.altitudeMode = altitudeMode.empty() ? "street_level" : altitudeMode;
+        _geospatialProviderRV->createAnchor(req,
+            [onSuccess, onFailure](ReactVisionCCA::ApiResult<ReactVisionCCA::GeospatialAnchorRecord> r) {
+                if (r.success) { if (onSuccess) onSuccess(r.data.id); }
+                else           { if (onFailure) onFailure(r.error.message); }
+            });
+        return;
+    }
+#endif
+    if (onFailure) onFailure("hostGeospatialAnchor requires ReactVision geospatial provider");
+}
+
+void VROARSessionARCore::createTerrainAnchor(double latitude, double longitude, double altitudeAboveTerrain,
+                                             VROQuaternion quaternion,
+                                             std::function<void(std::shared_ptr<VROGeospatialAnchor>)> onSuccess,
+                                             std::function<void(std::string error)> onFailure) {
+#if RVCCA_AVAILABLE
+    if (getGeospatialAnchorProvider() == VROGeospatialAnchorProvider::ReactVision) {
+        // Terrain alt = device altitude + offset above terrain (approximation)
+        double absoluteAlt = _lastKnownGPSPose.altitude + altitudeAboveTerrain;
+        std::string error;
+        auto anchor = createLocalGPSAnchor(_session, _lastKnownGPSPose,
+                                           latitude, longitude, absoluteAlt,
+                                           VROGeospatialAnchorType::Terrain, quaternion,
+                                           shared_from_this(), _geospatialProviderRV.get(), error);
+        if (anchor) { if (onSuccess) onSuccess(anchor); }
+        else         { if (onFailure) onFailure(error);  }
+        return;
+    }
+#endif
+    if (_geospatialMode == arcore::GeospatialMode::Disabled) {
+        if (onFailure) onFailure("Geospatial mode is disabled");
+        return;
+    }
+
+    std::weak_ptr<VROARSessionARCore> weakSession = shared_from_this();
+
+    _session->createTerrainAnchor(latitude, longitude, altitudeAboveTerrain, quaternion.X, quaternion.Y, quaternion.Z, quaternion.W,
+        [weakSession, latitude, longitude, altitudeAboveTerrain, quaternion, onSuccess](arcore::Anchor *nativeAnchor) {
+            VROPlatformDispatchAsyncRenderer([weakSession, latitude, longitude, altitudeAboveTerrain, quaternion, onSuccess, nativeAnchor] {
+                std::shared_ptr<VROARSessionARCore> session = weakSession.lock();
+                if (!session) {
+                    delete nativeAnchor;
+                    return;
+                }
+
+                // Create VROARAnchorARCore wrapper
+                std::shared_ptr<arcore::Anchor> anchorShared(nativeAnchor);
+                std::string key = VROStringUtil::toString64(anchorShared->getId());
+
+                // Create VROGeospatialAnchor with the same ID as the native anchor
+                std::shared_ptr<VROGeospatialAnchor> geoAnchor = std::make_shared<VROGeospatialAnchor>(
+                    VROGeospatialAnchorType::Terrain, latitude, longitude, altitudeAboveTerrain, quaternion);
+                geoAnchor->setId(key);
+                geoAnchor->setResolveState(VROGeospatialAnchorResolveState::Success);
+
+                // Create VROARAnchorARCore
+                std::shared_ptr<VROARAnchorARCore> vAnchor = std::make_shared<VROARAnchorARCore>(
+                    key, anchorShared, geoAnchor, session);
+
+                // Add to maps
+                session->addAnchor(vAnchor);
+
+                if (onSuccess) onSuccess(geoAnchor);
+            });
+        },
+        [onFailure](std::string error) {
+            VROPlatformDispatchAsyncRenderer([onFailure, error] {
+                if (onFailure) onFailure(error);
+            });
+        }
+    );
+}
+
+void VROARSessionARCore::createRooftopAnchor(double latitude, double longitude, double altitudeAboveRooftop,
+                                             VROQuaternion quaternion,
+                                             std::function<void(std::shared_ptr<VROGeospatialAnchor>)> onSuccess,
+                                             std::function<void(std::string error)> onFailure) {
+#if RVCCA_AVAILABLE
+    if (getGeospatialAnchorProvider() == VROGeospatialAnchorProvider::ReactVision) {
+        // Rooftop alt = device altitude + offset above rooftop (approximation)
+        double absoluteAlt = _lastKnownGPSPose.altitude + altitudeAboveRooftop;
+        std::string error;
+        auto anchor = createLocalGPSAnchor(_session, _lastKnownGPSPose,
+                                           latitude, longitude, absoluteAlt,
+                                           VROGeospatialAnchorType::Rooftop, quaternion,
+                                           shared_from_this(), _geospatialProviderRV.get(), error);
+        if (anchor) { if (onSuccess) onSuccess(anchor); }
+        else         { if (onFailure) onFailure(error);  }
+        return;
+    }
+#endif
+    if (_geospatialMode == arcore::GeospatialMode::Disabled) {
+        if (onFailure) onFailure("Geospatial mode is disabled");
+        return;
+    }
+
+    std::weak_ptr<VROARSessionARCore> weakSession = shared_from_this();
+
+    _session->createRooftopAnchor(latitude, longitude, altitudeAboveRooftop, quaternion.X, quaternion.Y, quaternion.Z, quaternion.W,
+        [weakSession, latitude, longitude, altitudeAboveRooftop, quaternion, onSuccess](arcore::Anchor *nativeAnchor) {
+            VROPlatformDispatchAsyncRenderer([weakSession, latitude, longitude, altitudeAboveRooftop, quaternion, onSuccess, nativeAnchor] {
+                std::shared_ptr<VROARSessionARCore> session = weakSession.lock();
+                if (!session) {
+                    delete nativeAnchor;
+                    return;
+                }
+
+                // Create VROARAnchorARCore wrapper
+                std::shared_ptr<arcore::Anchor> anchorShared(nativeAnchor);
+                std::string key = VROStringUtil::toString64(anchorShared->getId());
+
+                // Create VROGeospatialAnchor with the same ID as the native anchor
+                std::shared_ptr<VROGeospatialAnchor> geoAnchor = std::make_shared<VROGeospatialAnchor>(
+                    VROGeospatialAnchorType::Rooftop, latitude, longitude, altitudeAboveRooftop, quaternion);
+                geoAnchor->setId(key);
+                geoAnchor->setResolveState(VROGeospatialAnchorResolveState::Success);
+
+                // Create VROARAnchorARCore
+                std::shared_ptr<VROARAnchorARCore> vAnchor = std::make_shared<VROARAnchorARCore>(
+                    key, anchorShared, geoAnchor, session);
+
+                // Add to maps
+                session->addAnchor(vAnchor);
+
+                if (onSuccess) onSuccess(geoAnchor);
+            });
+        },
+        [onFailure](std::string error) {
+            VROPlatformDispatchAsyncRenderer([onFailure, error] {
+                if (onFailure) onFailure(error);
+            });
+        }
+    );
+}
+
+void VROARSessionARCore::removeGeospatialAnchor(std::shared_ptr<VROGeospatialAnchor> anchor) {
+    if (!anchor) return;
+
+    // Note: do NOT call _geospatialProviderRV->deleteAnchor() here.
+    // removeGeospatialAnchor only removes the anchor from the local AR session.
+    // Use rvDeleteGeospatialAnchor() to explicitly delete from the backend.
+
+    // Search by ID because the caller may pass a dummy anchor (from nativeRemoveGeospatialAnchor)
+    // that shares only the ID with the stored trackable, not the same pointer.
+    std::shared_ptr<VROARAnchorARCore> foundAnchor = nullptr;
+    const std::string &targetId = anchor->getId();
+    for (std::shared_ptr<VROARAnchorARCore> vAnchor : _anchors) {
+        auto trackable = vAnchor->getTrackable();
+        if (trackable && trackable->getId() == targetId) {
+            foundAnchor = vAnchor;
+            break;
+        }
+    }
+
+    if (foundAnchor) {
+        // Detach the native anchor if one exists (ARCore path only)
+        if (foundAnchor->getAnchorInternal()) {
+            foundAnchor->getAnchorInternal()->detach();
+        }
+        removeAnchor(foundAnchor);
+    }
+}
+
+#if RVCCA_AVAILABLE
+static std::string rvEscJsonARC(const std::string &s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        if (c == '"') out += "\\\"";
+        else if (c == '\\') out += "\\\\";
+        else out += c;
+    }
+    return out;
+}
+
+static std::string rvGeoAnchorToJsonARC(const ReactVisionCCA::GeospatialAnchorRecord &r) {
+    char buf[128];
+    std::string j = "{";
+    j += "\"id\":\"" + rvEscJsonARC(r.id) + "\",";
+    snprintf(buf, sizeof(buf), "%.10f", r.lat); j += "\"lat\":"; j += buf; j += ",";
+    snprintf(buf, sizeof(buf), "%.10f", r.lng); j += "\"lng\":"; j += buf; j += ",";
+    snprintf(buf, sizeof(buf), "%.4f", r.alt);  j += "\"alt\":"; j += buf; j += ",";
+    j += "\"altitudeMode\":\"" + rvEscJsonARC(r.altitudeMode) + "\",";
+    j += "\"name\":\"" + rvEscJsonARC(r.name) + "\",";
+    j += "\"description\":\"" + rvEscJsonARC(r.description) + "\",";
+    j += "\"createdAt\":\"" + rvEscJsonARC(r.createdAt) + "\",";
+    j += "\"updatedAt\":\"" + rvEscJsonARC(r.updatedAt) + "\",";
+    j += "\"sceneAssetId\":\"" + rvEscJsonARC(r.sceneAssetId) + "\",";
+    j += "\"sceneId\":\"" + rvEscJsonARC(r.sceneId) + "\",";
+    j += "\"userAssetId\":\"" + rvEscJsonARC(r.userAssetId) + "\",";
+    snprintf(buf, sizeof(buf), "%.2f", r.distanceMeters); j += "\"distanceMeters\":"; j += buf;
+    // creatorData
+    j += ",\"creatorData\":{";
+    j += "\"id\":\"" + rvEscJsonARC(r.creatorData.id) + "\",";
+    j += "\"firstName\":\"" + rvEscJsonARC(r.creatorData.firstName) + "\",";
+    j += "\"lastName\":\"" + rvEscJsonARC(r.creatorData.lastName) + "\"";
+    j += "}";
+    // sceneAssetData
+    if (r.hasSceneAsset) {
+        j += ",\"sceneAssetData\":{";
+        j += "\"id\":\"" + rvEscJsonARC(r.sceneAssetData.id) + "\",";
+        j += "\"name\":\"" + rvEscJsonARC(r.sceneAssetData.name) + "\",";
+        j += "\"assetId\":\"" + rvEscJsonARC(r.sceneAssetData.assetId) + "\",";
+        snprintf(buf, sizeof(buf), "%.4f", r.sceneAssetData.scale); j += "\"scale\":"; j += buf; j += ",";
+        snprintf(buf, sizeof(buf), "%.4f", r.sceneAssetData.positionX); j += "\"positionX\":"; j += buf; j += ",";
+        snprintf(buf, sizeof(buf), "%.4f", r.sceneAssetData.positionY); j += "\"positionY\":"; j += buf; j += ",";
+        snprintf(buf, sizeof(buf), "%.4f", r.sceneAssetData.positionZ); j += "\"positionZ\":"; j += buf; j += ",";
+        snprintf(buf, sizeof(buf), "%.4f", r.sceneAssetData.rotationX); j += "\"rotationX\":"; j += buf; j += ",";
+        snprintf(buf, sizeof(buf), "%.4f", r.sceneAssetData.rotationY); j += "\"rotationY\":"; j += buf; j += ",";
+        snprintf(buf, sizeof(buf), "%.4f", r.sceneAssetData.rotationZ); j += "\"rotationZ\":"; j += buf;
+        j += ",\"teamAsset\":{";
+        j += "\"id\":\"" + rvEscJsonARC(r.sceneAssetData.teamAsset.id) + "\",";
+        j += "\"name\":\"" + rvEscJsonARC(r.sceneAssetData.teamAsset.name) + "\",";
+        j += "\"fileUrl\":\"" + rvEscJsonARC(r.sceneAssetData.teamAsset.fileUrl) + "\",";
+        snprintf(buf, sizeof(buf), "%lld", (long long)r.sceneAssetData.teamAsset.fileSize); j += "\"fileSize\":"; j += buf; j += ",";
+        j += "\"assetType\":\"" + rvEscJsonARC(r.sceneAssetData.teamAsset.assetType) + "\"";
+        j += "}";
+        j += "}";
+    }
+    // sceneData
+    if (r.hasScene) {
+        j += ",\"sceneData\":{";
+        j += "\"id\":\"" + rvEscJsonARC(r.sceneData.id) + "\",";
+        j += "\"name\":\"" + rvEscJsonARC(r.sceneData.name) + "\",";
+        snprintf(buf, sizeof(buf), "%.10f", r.sceneData.latitude);  j += "\"latitude\":";  j += buf; j += ",";
+        snprintf(buf, sizeof(buf), "%.10f", r.sceneData.longitude); j += "\"longitude\":"; j += buf; j += ",";
+        j += "\"planeDetection\":\"" + rvEscJsonARC(r.sceneData.planeDetection) + "\",";
+        j += "\"planeDirection\":\"" + rvEscJsonARC(r.sceneData.planeDirection) + "\",";
+        j += "\"createdAt\":\"" + rvEscJsonARC(r.sceneData.createdAt) + "\",";
+        j += "\"sceneAssets\":[";
+        for (size_t i = 0; i < r.sceneData.sceneAssets.size(); ++i) {
+            const auto& sa = r.sceneData.sceneAssets[i];
+            if (i > 0) j += ",";
+            j += "{";
+            j += "\"id\":\"" + rvEscJsonARC(sa.id) + "\",";
+            j += "\"name\":\"" + rvEscJsonARC(sa.name) + "\",";
+            j += "\"assetId\":\"" + rvEscJsonARC(sa.assetId) + "\",";
+            snprintf(buf, sizeof(buf), "%.4f", sa.scale); j += "\"scale\":"; j += buf; j += ",";
+            snprintf(buf, sizeof(buf), "%.4f", sa.positionX); j += "\"positionX\":"; j += buf; j += ",";
+            snprintf(buf, sizeof(buf), "%.4f", sa.positionY); j += "\"positionY\":"; j += buf; j += ",";
+            snprintf(buf, sizeof(buf), "%.4f", sa.positionZ); j += "\"positionZ\":"; j += buf; j += ",";
+            snprintf(buf, sizeof(buf), "%.4f", sa.rotationX); j += "\"rotationX\":"; j += buf; j += ",";
+            snprintf(buf, sizeof(buf), "%.4f", sa.rotationY); j += "\"rotationY\":"; j += buf; j += ",";
+            snprintf(buf, sizeof(buf), "%.4f", sa.rotationZ); j += "\"rotationZ\":"; j += buf;
+            j += ",\"teamAsset\":{";
+            j += "\"id\":\"" + rvEscJsonARC(sa.teamAsset.id) + "\",";
+            j += "\"name\":\"" + rvEscJsonARC(sa.teamAsset.name) + "\",";
+            j += "\"fileUrl\":\"" + rvEscJsonARC(sa.teamAsset.fileUrl) + "\",";
+            snprintf(buf, sizeof(buf), "%lld", (long long)sa.teamAsset.fileSize); j += "\"fileSize\":"; j += buf; j += ",";
+            j += "\"assetType\":\"" + rvEscJsonARC(sa.teamAsset.assetType) + "\"";
+            j += "}";
+            j += "}";
+        }
+        j += "]";
+        j += "}";
+    }
+    // userAssetData
+    if (r.hasUserAsset) {
+        j += ",\"userAssetData\":{";
+        j += "\"id\":\"" + rvEscJsonARC(r.userAssetData.id) + "\",";
+        j += "\"name\":\"" + rvEscJsonARC(r.userAssetData.name) + "\",";
+        j += "\"description\":\"" + rvEscJsonARC(r.userAssetData.description) + "\",";
+        j += "\"fileUrl\":\"" + rvEscJsonARC(r.userAssetData.fileUrl) + "\",";
+        snprintf(buf, sizeof(buf), "%lld", (long long)r.userAssetData.fileSize); j += "\"fileSize\":"; j += buf; j += ",";
+        j += "\"assetType\":\"" + rvEscJsonARC(r.userAssetData.assetType) + "\",";
+        j += "\"externalUserId\":\"" + rvEscJsonARC(r.userAssetData.externalUserId) + "\",";
+        j += "\"moderationStatus\":\"" + rvEscJsonARC(r.userAssetData.moderationStatus) + "\",";
+        j += "\"createdAt\":\"" + rvEscJsonARC(r.userAssetData.createdAt) + "\"";
+        j += "}";
+    }
+    j += "}";
+    return j;
+}
+#endif // RVCCA_AVAILABLE
+
+void VROARSessionARCore::rvGetGeospatialAnchor(
+    const std::string& anchorId,
+    std::function<void(bool, std::string, std::string)> callback) {
+#if RVCCA_AVAILABLE
+    if (_geospatialProviderRV) {
+        _geospatialProviderRV->getAnchor(anchorId,
+            [callback](ReactVisionCCA::ApiResult<ReactVisionCCA::GeospatialAnchorRecord> r) {
+            if (callback) {
+                if (r.success) callback(true, rvGeoAnchorToJsonARC(r.data), "");
+                else            callback(false, "", r.error.message);
+            }
+        });
+        return;
+    }
+#endif
+    if (callback) callback(false, "", "ReactVision geospatial provider not available");
+}
+
+void VROARSessionARCore::rvFindNearbyGeospatialAnchors(
+    double lat, double lng, double radius, int limit,
+    std::function<void(bool, std::string, std::string)> callback) {
+#if RVCCA_AVAILABLE
+    if (_geospatialProviderRV) {
+        _geospatialProviderRV->findNearby(lat, lng, radius, limit,
+            [callback](ReactVisionCCA::ApiResult<std::vector<ReactVisionCCA::GeospatialAnchorRecord>> r) {
+            if (callback) {
+                if (r.success) {
+                    std::string json = "[";
+                    for (size_t i = 0; i < r.data.size(); ++i) {
+                        if (i > 0) json += ",";
+                        json += rvGeoAnchorToJsonARC(r.data[i]);
+                    }
+                    json += "]";
+                    callback(true, json, "");
+                } else {
+                    callback(false, "", r.error.message);
+                }
+            }
+        });
+        return;
+    }
+#endif
+    if (callback) callback(false, "", "ReactVision geospatial provider not available");
+}
+
+void VROARSessionARCore::rvUpdateGeospatialAnchor(
+    const std::string& anchorId,
+    const std::string& sceneAssetId,
+    const std::string& sceneId,
+    const std::string& name,
+    const std::string& userAssetId,
+    std::function<void(bool, std::string, std::string)> callback) {
+#if RVCCA_AVAILABLE
+    if (_geospatialProviderRV) {
+        ReactVisionCCA::GeospatialUpdateRequest req;
+        if (!sceneAssetId.empty()) req.sceneAssetId = sceneAssetId;
+        if (!sceneId.empty())      req.sceneId      = sceneId;
+        if (!name.empty())         req.name         = name;
+        if (!userAssetId.empty())  req.userAssetId  = userAssetId;
+        _geospatialProviderRV->updateAnchor(anchorId, req,
+            [callback](ReactVisionCCA::ApiResult<ReactVisionCCA::GeospatialAnchorRecord> r) {
+            if (callback) {
+                if (r.success) callback(true, rvGeoAnchorToJsonARC(r.data), "");
+                else            callback(false, "", r.error.message);
+            }
+        });
+        return;
+    }
+#endif
+    if (callback) callback(false, "", "ReactVision geospatial provider not available");
+}
+
+void VROARSessionARCore::rvUploadAsset(
+    const std::string& filePath,
+    const std::string& assetType,
+    const std::string& fileName,
+    const std::string& appUserId,
+    std::function<void(bool, std::string, std::string, std::string)> callback) {
+#if RVCCA_AVAILABLE
+    if (_geospatialProviderRV) {
+        // Strip "file://" prefix — std::ifstream needs a plain filesystem path
+        std::string path = filePath;
+        if (path.rfind("file://", 0) == 0) path = path.substr(7);
+        std::ifstream file(path, std::ios::binary);
+        if (!file.is_open()) {
+            if (callback) callback(false, "", "", "Failed to open file: " + path);
+            return;
+        }
+        std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(file)), {});
+        file.close();
+        _geospatialProviderRV->uploadAsset(assetType, fileName, bytes, appUserId,
+            [callback](ReactVisionCCA::ApiResult<ReactVisionCCA::AssetUploadResult> r) {
+            if (callback) {
+                if (r.success) callback(true, r.data.id, r.data.url.empty() ? r.data.fileUrl : r.data.url, "");
+                else            callback(false, "", "", r.error.message);
+            }
+        });
+        return;
+    }
+#endif
+    if (callback) callback(false, "", "", "ReactVision geospatial provider not available");
+}
+
+void VROARSessionARCore::rvDeleteGeospatialAnchor(
+    const std::string& anchorId,
+    std::function<void(bool, std::string)> callback) {
+#if RVCCA_AVAILABLE
+    if (_geospatialProviderRV) {
+        _geospatialProviderRV->deleteAnchor(anchorId,
+            [callback](bool success, ReactVisionCCA::ApiError err) {
+            if (callback) {
+                callback(success, success ? "" : err.message);
+            }
+        });
+        return;
+    }
+#endif
+    if (callback) callback(false, "ReactVision geospatial provider not available");
+}
+
+void VROARSessionARCore::rvListGeospatialAnchors(
+    int limit, int offset,
+    std::function<void(bool, std::string, std::string)> callback) {
+#if RVCCA_AVAILABLE
+    if (_geospatialProviderRV) {
+        _geospatialProviderRV->listAnchors(limit, offset,
+            [callback](ReactVisionCCA::ApiResult<ReactVisionCCA::GeospatialListResult> r) {
+            if (callback) {
+                if (r.success) {
+                    std::string json = "[";
+                    const auto& anchors = r.data.anchors;
+                    for (size_t i = 0; i < anchors.size(); ++i) {
+                        if (i > 0) json += ",";
+                        json += rvGeoAnchorToJsonARC(anchors[i]);
+                    }
+                    json += "]";
+                    callback(true, json, "");
+                } else {
+                    callback(false, "", r.error.message);
+                }
+            }
+        });
+        return;
+    }
+#endif
+    if (callback) callback(false, "", "ReactVision geospatial provider not available");
+}
+
+// ── Cloud anchor management ───────────────────────────────────────────────────
+
+#if RVCCA_AVAILABLE
+static std::string rvSceneAssetToJsonARC(const ReactVisionCCA::SceneAPIAsset& a) {
+    char buf[256];
+    std::string j = "{";
+    j += "\"id\":\"" + rvEscJsonARC(a.id) + "\",";
+    j += "\"name\":\"" + rvEscJsonARC(a.name) + "\",";
+    j += "\"description\":\"" + rvEscJsonARC(a.description) + "\",";
+    j += "\"fileUrl\":\"" + rvEscJsonARC(a.fileUrl) + "\",";
+    j += "\"fileSize\":" + std::to_string(a.fileSize) + ",";
+    j += "\"assetTypeName\":\"" + rvEscJsonARC(a.assetTypeName) + "\",";
+    snprintf(buf, sizeof(buf), "%.6f", a.positionX); j += "\"positionX\":"; j += buf; j += ",";
+    snprintf(buf, sizeof(buf), "%.6f", a.positionY); j += "\"positionY\":"; j += buf; j += ",";
+    snprintf(buf, sizeof(buf), "%.6f", a.positionZ); j += "\"positionZ\":"; j += buf; j += ",";
+    snprintf(buf, sizeof(buf), "%.6f", a.rotationX); j += "\"rotationX\":"; j += buf; j += ",";
+    snprintf(buf, sizeof(buf), "%.6f", a.rotationY); j += "\"rotationY\":"; j += buf; j += ",";
+    snprintf(buf, sizeof(buf), "%.6f", a.rotationZ); j += "\"rotationZ\":"; j += buf; j += ",";
+    snprintf(buf, sizeof(buf), "%.6f", a.scale);     j += "\"scale\":";     j += buf; j += ",";
+    snprintf(buf, sizeof(buf), "%.10f", a.latitude);  j += "\"latitude\":";  j += buf; j += ",";
+    snprintf(buf, sizeof(buf), "%.10f", a.longitude); j += "\"longitude\":"; j += buf; j += ",";
+    j += std::string("\"isDraggable\":") + (a.isDraggable ? "true" : "false") + ",";
+    j += "\"triggerImageUrl\":\"" + rvEscJsonARC(a.triggerImageUrl) + "\",";
+    j += "\"triggerImageOrientation\":\"" + rvEscJsonARC(a.triggerImageOrientation) + "\",";
+    snprintf(buf, sizeof(buf), "%.6f", a.triggerImagePhysicalWidthM);
+    j += "\"triggerImagePhysicalWidthM\":"; j += buf; j += ",";
+    j += "\"createdAt\":\"" + rvEscJsonARC(a.createdAt) + "\",";
+    j += "\"updatedAt\":\"" + rvEscJsonARC(a.updatedAt) + "\"";
+    j += "}";
+    return j;
+}
+
+static std::string rvCloudAssetToJsonARC(const ReactVisionCCA::CloudAnchorAsset& a) {
+    char buf[256];
+    std::string j = "{";
+    j += "\"id\":\"" + rvEscJsonARC(a.id) + "\",";
+    j += "\"name\":\"" + rvEscJsonARC(a.name) + "\",";
+    j += "\"fileUrl\":\"" + rvEscJsonARC(a.fileUrl) + "\",";
+    j += "\"assetType\":\"" + rvEscJsonARC(a.assetType) + "\",";
+    snprintf(buf, sizeof(buf), "%.6f", a.positionX); j += "\"positionX\":"; j += buf; j += ",";
+    snprintf(buf, sizeof(buf), "%.6f", a.positionY); j += "\"positionY\":"; j += buf; j += ",";
+    snprintf(buf, sizeof(buf), "%.6f", a.positionZ); j += "\"positionZ\":"; j += buf; j += ",";
+    snprintf(buf, sizeof(buf), "%.6f", a.rotationX); j += "\"rotationX\":"; j += buf; j += ",";
+    snprintf(buf, sizeof(buf), "%.6f", a.rotationY); j += "\"rotationY\":"; j += buf; j += ",";
+    snprintf(buf, sizeof(buf), "%.6f", a.rotationZ); j += "\"rotationZ\":"; j += buf; j += ",";
+    snprintf(buf, sizeof(buf), "%.6f", a.rotationW); j += "\"rotationW\":"; j += buf; j += ",";
+    snprintf(buf, sizeof(buf), "%.6f", a.scale);     j += "\"scale\":";     j += buf; j += ",";
+    j += std::string("\"isVisible\":") + (a.isVisible ? "true" : "false");
+    j += "}";
+    return j;
+}
+
+static std::string rvCloudAnchorToJsonARC(const ReactVisionCCA::CloudAnchorRecord& r) {
+    char buf[128];
+    std::string j = "{";
+    j += "\"id\":\"" + rvEscJsonARC(r.id) + "\",";
+    j += "\"projectId\":\"" + rvEscJsonARC(r.projectId) + "\",";
+    j += "\"name\":\"" + rvEscJsonARC(r.name) + "\",";
+    j += "\"description\":\"" + rvEscJsonARC(r.description) + "\",";
+    snprintf(buf, sizeof(buf), "%.4f", r.cameraFx); j += "\"cameraFx\":"; j += buf; j += ",";
+    snprintf(buf, sizeof(buf), "%.4f", r.cameraFy); j += "\"cameraFy\":"; j += buf; j += ",";
+    snprintf(buf, sizeof(buf), "%.4f", r.cameraCx); j += "\"cameraCx\":"; j += buf; j += ",";
+    snprintf(buf, sizeof(buf), "%.4f", r.cameraCy); j += "\"cameraCy\":"; j += buf; j += ",";
+    j += "\"imageWidth\":" + std::to_string(r.imageWidth) + ",";
+    j += "\"imageHeight\":" + std::to_string(r.imageHeight) + ",";
+    j += "\"descriptorsUrl\":\"" + rvEscJsonARC(r.descriptorsUrl) + "\",";
+    j += "\"descriptorCount\":" + std::to_string(r.descriptorCount) + ",";
+    j += "\"keypointCount\":" + std::to_string(r.keypointCount) + ",";
+    snprintf(buf, sizeof(buf), "%.10f", r.latitude);  j += "\"latitude\":";  j += buf; j += ",";
+    snprintf(buf, sizeof(buf), "%.10f", r.longitude); j += "\"longitude\":"; j += buf; j += ",";
+    snprintf(buf, sizeof(buf), "%.4f",  r.altitude);  j += "\"altitude\":";  j += buf; j += ",";
+    j += "\"platform\":\"" + rvEscJsonARC(r.platform) + "\",";
+    j += "\"deviceModel\":\"" + rvEscJsonARC(r.deviceModel) + "\",";
+    j += "\"externalUserId\":\"" + rvEscJsonARC(r.externalUserId) + "\",";
+    j += std::string("\"isPublic\":") + (r.isPublic ? "true" : "false") + ",";
+    j += "\"resolveCount\":" + std::to_string(r.resolveCount) + ",";
+    j += "\"successfulResolveCount\":" + std::to_string(r.successfulResolveCount) + ",";
+    snprintf(buf, sizeof(buf), "%.4f", r.averageConfidence); j += "\"averageConfidence\":"; j += buf; j += ",";
+    j += "\"lastResolvedAt\":\"" + rvEscJsonARC(r.lastResolvedAt) + "\",";
+    j += "\"createdAt\":\"" + rvEscJsonARC(r.createdAt) + "\",";
+    j += "\"tags\":[";
+    for (size_t i = 0; i < r.tags.size(); ++i) {
+        if (i > 0) j += ",";
+        j += "\"" + rvEscJsonARC(r.tags[i]) + "\"";
+    }
+    j += "],\"assets\":[";
+    for (size_t i = 0; i < r.assets.size(); ++i) {
+        if (i > 0) j += ",";
+        j += rvCloudAssetToJsonARC(r.assets[i]);
+    }
+    j += "]}";
+    return j;
+}
+#endif // RVCCA_AVAILABLE
+
+void VROARSessionARCore::rvGetCloudAnchor(
+    const std::string& anchorId,
+    std::function<void(bool, std::string, std::string)> callback) {
+#if RVCCA_AVAILABLE
+    if (_cloudAnchorProviderRV) {
+        auto p = _cloudAnchorProviderRV->getProvider();
+        if (p) {
+            p->getCloudAnchor(anchorId,
+                [callback](ReactVisionCCA::ApiResult<ReactVisionCCA::CloudAnchorRecord> r) {
+                if (callback) {
+                    if (r.success) callback(true, rvCloudAnchorToJsonARC(r.data), "");
+                    else            callback(false, "", r.error.message);
+                }
+            });
+            return;
+        }
+    }
+#endif
+    if (callback) callback(false, "", "ReactVision cloud anchor provider not available");
+}
+
+void VROARSessionARCore::rvListCloudAnchors(
+    int limit, int offset,
+    std::function<void(bool, std::string, std::string)> callback) {
+#if RVCCA_AVAILABLE
+    if (_cloudAnchorProviderRV) {
+        auto p = _cloudAnchorProviderRV->getProvider();
+        if (p) {
+            p->listCloudAnchors(limit, offset,
+                [callback](ReactVisionCCA::ApiResult<std::vector<ReactVisionCCA::CloudAnchorRecord>> r) {
+                if (callback) {
+                    if (r.success) {
+                        std::string json = "[";
+                        for (size_t i = 0; i < r.data.size(); ++i) {
+                            if (i > 0) json += ",";
+                            json += rvCloudAnchorToJsonARC(r.data[i]);
+                        }
+                        json += "]";
+                        callback(true, json, "");
+                    } else {
+                        callback(false, "", r.error.message);
+                    }
+                }
+            });
+            return;
+        }
+    }
+#endif
+    if (callback) callback(false, "", "ReactVision cloud anchor provider not available");
+}
+
+void VROARSessionARCore::rvUpdateCloudAnchor(
+    const std::string& anchorId,
+    const std::string& name,
+    const std::string& description,
+    bool isPublic,
+    std::function<void(bool, std::string, std::string)> callback) {
+#if RVCCA_AVAILABLE
+    if (_cloudAnchorProviderRV) {
+        auto p = _cloudAnchorProviderRV->getProvider();
+        if (p) {
+            p->updateCloudAnchor(anchorId, name, description, isPublic,
+                [callback](ReactVisionCCA::ApiResult<ReactVisionCCA::CloudAnchorRecord> r) {
+                if (callback) {
+                    if (r.success) callback(true, rvCloudAnchorToJsonARC(r.data), "");
+                    else            callback(false, "", r.error.message);
+                }
+            });
+            return;
+        }
+    }
+#endif
+    if (callback) callback(false, "", "ReactVision cloud anchor provider not available");
+}
+
+void VROARSessionARCore::rvDeleteCloudAnchor(
+    const std::string& anchorId,
+    std::function<void(bool, std::string)> callback) {
+#if RVCCA_AVAILABLE
+    if (_cloudAnchorProviderRV) {
+        auto p = _cloudAnchorProviderRV->getProvider();
+        if (p) {
+            p->deleteCloudAnchor(anchorId,
+                [callback](bool success, ReactVisionCCA::ApiError err) {
+                if (callback) callback(success, success ? "" : err.message);
+            });
+            return;
+        }
+    }
+#endif
+    if (callback) callback(false, "ReactVision cloud anchor provider not available");
+}
+
+void VROARSessionARCore::rvFindNearbyCloudAnchors(
+    double lat, double lng, double radius, int limit,
+    std::function<void(bool, std::string, std::string)> callback) {
+#if RVCCA_AVAILABLE
+    if (_cloudAnchorProviderRV) {
+        auto p = _cloudAnchorProviderRV->getProvider();
+        if (p) {
+            p->findNearbyCloudAnchors(lat, lng, radius, limit,
+                [callback](ReactVisionCCA::ApiResult<std::vector<ReactVisionCCA::CloudAnchorRecord>> r) {
+                if (callback) {
+                    if (r.success) {
+                        std::string json = "[";
+                        for (size_t i = 0; i < r.data.size(); ++i) {
+                            if (i > 0) json += ",";
+                            json += rvCloudAnchorToJsonARC(r.data[i]);
+                        }
+                        json += "]";
+                        callback(true, json, "");
+                    } else {
+                        callback(false, "", r.error.message);
+                    }
+                }
+            });
+            return;
+        }
+    }
+#endif
+    if (callback) callback(false, "", "ReactVision cloud anchor provider not available");
+}
+
+void VROARSessionARCore::rvAttachAssetToCloudAnchor(
+    const std::string& anchorId,
+    const std::string& fileUrl,
+    int64_t fileSize,
+    const std::string& name,
+    const std::string& assetType,
+    const std::string& externalUserId,
+    std::function<void(bool, std::string)> callback) {
+#if RVCCA_AVAILABLE
+    if (_cloudAnchorProviderRV) {
+        auto p = _cloudAnchorProviderRV->getProvider();
+        if (p) {
+            p->attachAssetToCloudAnchor(anchorId, fileUrl, fileSize, name, assetType, externalUserId,
+                [callback](bool success, ReactVisionCCA::ApiError err) {
+                if (callback) callback(success, success ? "" : err.message);
+            });
+            return;
+        }
+    }
+#endif
+    if (callback) callback(false, "ReactVision cloud anchor provider not available");
+}
+
+void VROARSessionARCore::rvRemoveAssetFromCloudAnchor(
+    const std::string& anchorId,
+    const std::string& assetId,
+    std::function<void(bool, std::string)> callback) {
+#if RVCCA_AVAILABLE
+    if (_cloudAnchorProviderRV) {
+        auto p = _cloudAnchorProviderRV->getProvider();
+        if (p) {
+            p->removeAssetFromCloudAnchor(anchorId, assetId,
+                [callback](bool success, ReactVisionCCA::ApiError err) {
+                if (callback) callback(success, success ? "" : err.message);
+            });
+            return;
+        }
+    }
+#endif
+    if (callback) callback(false, "ReactVision cloud anchor provider not available");
+}
+
+void VROARSessionARCore::rvTrackCloudAnchorResolution(
+    const std::string& anchorId,
+    bool success,
+    double confidence,
+    int matchCount,
+    int inlierCount,
+    int processingTimeMs,
+    const std::string& platform,
+    const std::string& externalUserId,
+    std::function<void(bool, std::string)> callback) {
+#if RVCCA_AVAILABLE
+    if (_cloudAnchorProviderRV) {
+        auto p = _cloudAnchorProviderRV->getProvider();
+        if (p) {
+            p->trackResolution(anchorId, success, confidence, matchCount, inlierCount,
+                processingTimeMs, platform, externalUserId,
+                [callback](bool ok, ReactVisionCCA::ApiError err) {
+                if (callback) callback(ok, ok ? "" : err.message);
+            });
+            return;
+        }
+    }
+#endif
+    if (callback) callback(false, "ReactVision cloud anchor provider not available");
+}
+
+void VROARSessionARCore::rvGetProject(
+    const std::string& projectId,
+    std::function<void(bool, std::string, std::string)> callback) {
+#if RVCCA_AVAILABLE
+    if (_cloudAnchorProviderRV) {
+        auto p = _cloudAnchorProviderRV->getProvider();
+        if (p) {
+            p->getProject(projectId,
+                [callback](ReactVisionCCA::ApiResult<std::string> r) {
+                if (callback) {
+                    callback(r.success, r.data, r.success ? "" : r.error.message);
+                }
+            });
+            return;
+        }
+    }
+#endif
+    if (callback) callback(false, "", "ReactVision cloud anchor provider not available");
+}
+
+void VROARSessionARCore::rvGetScene(
+    const std::string& sceneId,
+    std::function<void(bool, std::string, std::string)> callback) {
+#if RVCCA_AVAILABLE
+    if (_cloudAnchorProviderRV) {
+        auto p = _cloudAnchorProviderRV->getProvider();
+        if (p) {
+            p->getScene(sceneId,
+                [callback](ReactVisionCCA::ApiResult<std::string> r) {
+                if (callback) {
+                    callback(r.success, r.data, r.success ? "" : r.error.message);
+                }
+            });
+            return;
+        }
+    }
+#endif
+    if (callback) callback(false, "", "ReactVision cloud anchor provider not available");
+}
+
+void VROARSessionARCore::rvGetSceneAssets(
+    const std::string& sceneId,
+    std::function<void(bool, std::string, std::string)> callback) {
+#if RVCCA_AVAILABLE
+    if (_cloudAnchorProviderRV) {
+        auto p = _cloudAnchorProviderRV->getProvider();
+        if (p) {
+            p->getSceneAssets(sceneId,
+                [callback](ReactVisionCCA::ApiResult<std::vector<ReactVisionCCA::SceneAPIAsset>> r) {
+                if (callback) {
+                    if (r.success) {
+                        std::string json = "[";
+                        for (size_t i = 0; i < r.data.size(); ++i) {
+                            if (i > 0) json += ",";
+                            json += rvSceneAssetToJsonARC(r.data[i]);
+                        }
+                        json += "]";
+                        callback(true, json, "");
+                    } else {
+                        callback(false, "", r.error.message);
+                    }
+                }
+            });
+            return;
+        }
+    }
+#endif
+    if (callback) callback(false, "", "ReactVision cloud anchor provider not available");
+}
+
+#pragma mark - Scene Semantics API
+
+bool VROARSessionARCore::isSemanticModeSupported() const {
+    if (!_session) return false;
+
+    // Check if ARCore supports semantic mode on this device
+    // This also validates that the ARCore version is 1.40+
+    return _session->isSemanticModeSupported(arcore::SemanticMode::Enabled);
+}
+
+void VROARSessionARCore::setSemanticModeEnabled(bool enabled) {
+    pinfo("setSemanticModeEnabled called with enabled=%s (current: _semanticMode=%d, _semanticModeEnabled=%s)",
+          enabled ? "true" : "false", (int)_semanticMode, _semanticModeEnabled ? "true" : "false");
+
+    if (!_session) {
+        pwarn("setSemanticModeEnabled: No session, returning early");
+        return;
+    }
+
+    arcore::SemanticMode newMode = enabled ? arcore::SemanticMode::Enabled : arcore::SemanticMode::Disabled;
+
+    // Avoid unnecessary reconfiguration if mode hasn't changed
+    // Check both the ARCore mode AND the enabled flag to handle initialization properly
+    if (_semanticMode == newMode && _semanticModeEnabled == enabled) {
+        pinfo("setSemanticModeEnabled: Mode unchanged, returning early");
+        return;
+    }
+
+    // Check if semantic mode is supported before enabling
+    if (enabled && !isSemanticModeSupported()) {
+        pwarn("⚠️ Scene Semantics is not supported on this device, ignoring setSemanticModeEnabled(true)");
+        return;
+    }
+
+    _semanticMode = newMode;
+    _semanticModeEnabled = enabled;
+    pinfo("setSemanticModeEnabled: About to call updateARCoreConfig with _semanticMode=%d", (int)_semanticMode);
+
+    if (updateARCoreConfig()) {
+        pinfo("Scene Semantics mode set to %s", enabled ? "ENABLED" : "DISABLED");
+    } else {
+        pwarn("⚠️ Failed to update ARCore config for Scene Semantics");
+        // Revert the state
+        _semanticMode = arcore::SemanticMode::Disabled;
+        _semanticModeEnabled = false;
+    }
+}
+
+void VROARSessionARCore::updateDepthTexture() {
+    if (!isDepthModeEnabled()) {
+        return;
+    }
+
+    // Acquire depth image from ARCore
+    arcore::Image *depthImage = nullptr;
+    arcore::ImageRetrievalStatus status = _frame->acquireDepthImage(&depthImage);
+
+    if (status != arcore::ImageRetrievalStatus::Success || depthImage == nullptr) {
+        // pwarn("VROARSessionARCore: Failed to acquire depth image. Status: %d", (int)status);
+        return;
+    }
+
+    int width = depthImage->getWidth();
+    int height = depthImage->getHeight();
+
+    if (width <= 0 || height <= 0) {
+        pwarn("VROARSessionARCore: Invalid depth image dimensions: %d x %d", width, height);
+        delete depthImage;
+        return;
+    }
+
+    // Get depth data (16-bit depth in millimeters)
+    const uint8_t *depthData = nullptr;
+    int depthDataLength = 0;
+    depthImage->getPlaneData(0, &depthData, &depthDataLength);
+
+    int rowStride = depthImage->getPlaneRowStride(0);
+
+    if (depthData == nullptr || depthDataLength <= 0) {
+        pwarn("VROARSessionARCore: Invalid depth data. Length: %d", depthDataLength);
+        delete depthImage;
+        return;
+    }
+
+    // Convert to float buffer
+    int numPixels = width * height;
+    if (_depthFloatBuffer.size() != numPixels) {
+        _depthFloatBuffer.resize(numPixels);
+    }
+
+    float *floatData = _depthFloatBuffer.data();
+    
+    // Handle row stride (padding)
+    if (rowStride > 0 && rowStride != width * 2) {
+        for (int y = 0; y < height; y++) {
+            const uint16_t *rowStart = reinterpret_cast<const uint16_t*>(depthData + y * rowStride);
+            for (int x = 0; x < width; x++) {
+                floatData[y * width + x] = (float)rowStart[x] * 0.001f;
+            }
+        }
+    } else {
+        // Optimized loop: direct pointer access (packed)
+        const uint16_t *depthData16 = reinterpret_cast<const uint16_t*>(depthData);
+        for (int i = 0; i < numPixels; i++) {
+            floatData[i] = (float)depthData16[i] * 0.001f; // mm to meters
+        }
+    }
+
+    // If texture doesn't exist, create it
+    if (!_depthTexture || _depthTexture->getWidth() != width || _depthTexture->getHeight() != height) {
+        pinfo("VROARSessionARCore: Creating new depth texture (size %d x %d)", width, height);
+        std::shared_ptr<VROData> depthVROData = std::make_shared<VROData>(
+            (void *)floatData, numPixels * sizeof(float), VRODataOwnership::Copy);
+        std::vector<std::shared_ptr<VROData>> dataVec = { depthVROData };
+
+        _depthTexture = std::make_shared<VROTexture>(VROTextureType::Texture2D,
+                                                      VROTextureFormat::R32F,
+                                                      VROTextureInternalFormat::R32F,
+                                                      false,
+                                                      VROMipmapMode::None,
+                                                      dataVec,
+                                                      width, height,
+                                                      std::vector<uint32_t>());
+        
+        _depthTexture->setMinificationFilter(VROFilterMode::Nearest);
+        _depthTexture->setMagnificationFilter(VROFilterMode::Nearest);
+        // Use Clamp which maps to GL_CLAMP_TO_EDGE for OpenGL ES compatibility
+        _depthTexture->setWrapS(VROWrapMode::Clamp);
+        _depthTexture->setWrapT(VROWrapMode::Clamp);
+    } else {
+        // Update existing texture
+        std::shared_ptr<VRODriver> driver = _driver.lock();
+        if (driver) {
+            VROTextureSubstrate *substrate = _depthTexture->getSubstrate(0, driver, true);
+            if (substrate) {
+                // We need to cast to OpenGL substrate to access GL ID, or use a generic update method if available.
+                // Since we are in VROARSessionARCore (Android specific), we can assume OpenGL.
+                VROTextureSubstrateOpenGL *glSubstrate = (VROTextureSubstrateOpenGL *)substrate;
+                std::pair<GLenum, GLuint> textureInfo = glSubstrate->getTexture();
+                GLenum target = textureInfo.first;
+                GLuint texId = textureInfo.second;
+                
+                glBindTexture(target, texId);
+                glTexSubImage2D(target, 0, 0, 0, width, height, GL_RED, GL_FLOAT, floatData);
+                glBindTexture(target, 0);
+            } else {
+                pwarn("VROARSessionARCore: Failed to get substrate for depth texture update");
+            }
+        } else {
+            pwarn("VROARSessionARCore: Driver expired, cannot update depth texture");
+        }
+    }
+
+    delete depthImage;
+}
+
+// Helper: create or update an R8 GPU texture with the given pixel data.
+static void uploadR8Texture(std::shared_ptr<VROTexture> &texture,
+                             const uint8_t *data, int dataLength,
+                             int width, int height,
+                             std::weak_ptr<VRODriver> driverWeak) {
+    if (!texture || texture->getWidth() != width || texture->getHeight() != height) {
+        auto vData = std::make_shared<VROData>((void *)data, dataLength, VRODataOwnership::Copy);
+        std::vector<std::shared_ptr<VROData>> dataVec{ vData };
+        std::vector<uint32_t> mipSizes;
+        texture = std::make_shared<VROTexture>(
+            VROTextureType::Texture2D, VROTextureFormat::R8, VROTextureInternalFormat::R8,
+            false, VROMipmapMode::None,
+            dataVec, width, height, mipSizes);
+        texture->setMinificationFilter(VROFilterMode::Nearest);
+        texture->setMagnificationFilter(VROFilterMode::Nearest);
+        texture->setWrapS(VROWrapMode::Clamp);
+        texture->setWrapT(VROWrapMode::Clamp);
+    } else {
+        std::shared_ptr<VRODriver> driver = driverWeak.lock();
+        if (driver) {
+            VROTextureSubstrate *substrate = texture->getSubstrate(0, driver, true);
+            if (substrate) {
+                VROTextureSubstrateOpenGL *glSubstrate = (VROTextureSubstrateOpenGL *)substrate;
+                std::pair<GLenum, GLuint> texInfo = glSubstrate->getTexture();
+                glBindTexture(texInfo.first, texInfo.second);
+                glTexSubImage2D(texInfo.first, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, data);
+                glBindTexture(texInfo.first, 0);
+            }
+        }
+    }
+}
+
+void VROARSessionARCore::updateSemanticTexture() {
+    if (!_frame) {
+        return;
+    }
+
+    // --- Acquire semantic label image ---
+    arcore::Image *semanticImage = nullptr;
+    if (_frame->acquireSemanticImage(&semanticImage) != arcore::ImageRetrievalStatus::Success
+        || semanticImage == nullptr) {
+        // Not yet available (normal for first few frames) — keep previous texture.
+        return;
+    }
+
+    int width  = semanticImage->getWidth();
+    int height = semanticImage->getHeight();
+    if (width <= 0 || height <= 0) { delete semanticImage; return; }
+
+    const uint8_t *rawLabel = nullptr;
+    int dataLength = 0;
+    semanticImage->getPlaneData(0, &rawLabel, &dataLength);
+    if (!rawLabel || dataLength <= 0) { delete semanticImage; return; }
+
+    // --- Acquire confidence image (always; used for alpha blend + optional threshold) ---
+    arcore::Image *confImage = nullptr;
+    const uint8_t *rawConf  = nullptr;
+    int confLength           = 0;
+    if (_frame->acquireSemanticConfidenceImage(&confImage) == arcore::ImageRetrievalStatus::Success
+        && confImage != nullptr
+        && confImage->getWidth() == width && confImage->getHeight() == height) {
+        confImage->getPlaneData(0, &rawConf, &confLength);
+        if (confLength != dataLength) rawConf = nullptr;
+    }
+
+    // --- Make mutable working copies ---
+    // labelData: temporal-smoothed labels; confData: paired per-pixel confidence.
+    std::vector<uint8_t> labelData(rawLabel, rawLabel + dataLength);
+    std::vector<uint8_t> confData(dataLength, 255); // default full confidence when unavailable
+    if (rawConf) {
+        std::copy(rawConf, rawConf + dataLength, confData.begin());
+    }
+
+    // --- CPU confidence threshold: mask low-confidence pixels to unlabeled ---
+    if (_semanticConfidenceThreshold > 0.0f && rawConf) {
+        uint8_t threshold = (uint8_t)(_semanticConfidenceThreshold * 255.0f);
+        for (int i = 0; i < dataLength; i++) {
+            if (confData[i] < threshold) {
+                labelData[i] = 0; // unlabeled
+            }
+        }
+    }
+
+    // --- Temporal holdout: suppress isolated label→unlabeled flicker ---
+    // When a pixel was labeled on the previous frame but reads unlabeled now,
+    // hold the previous label with a slightly decayed confidence. This eliminates
+    // single-frame drop-outs at segmentation boundaries without adding latency
+    // to genuine label changes (which remain unlabeled across multiple frames).
+    if ((int)_prevSemanticData.size() == dataLength) {
+        for (int i = 0; i < dataLength; i++) {
+            if (labelData[i] == 0 && _prevSemanticData[i] != 0) {
+                labelData[i] = _prevSemanticData[i];
+                // Decay confidence slightly to signal the holdout state.
+                confData[i]  = (uint8_t)(_prevConfidenceData[i] * 0.75f);
+            }
+        }
+    }
+
+    // Save smoothed buffers for the next frame.
+    _prevSemanticData   = labelData;
+    _prevConfidenceData = confData;
+
+    delete semanticImage;
+    if (confImage) { delete confImage; }
+
+    // --- Upload label texture ---
+    uploadR8Texture(_semanticTexture, labelData.data(), dataLength, width, height, _driver);
+
+    // --- Upload confidence texture ---
+    uploadR8Texture(_semanticConfidenceTexture, confData.data(), dataLength, width, height, _driver);
 }

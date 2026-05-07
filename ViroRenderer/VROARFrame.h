@@ -28,6 +28,8 @@
 #define VROARFrame_h
 
 #include "VROARPointCloud.h"
+#include "VROMatrix4f.h"
+#include "VROSemantics.h"
 
 #include <memory>
 #include <vector>
@@ -37,7 +39,8 @@
 class VROARCamera;
 class VROARAnchor;
 class VROARHitTestResult;
-class VROMatrix4f;
+class VROARDepthMesh;
+class VROTexture;
 enum class VROARHitTestResultType;
 enum class VROCameraOrientation;
 
@@ -115,6 +118,132 @@ public:
      Retrieves the point cloud from this frame.
      */
     virtual std::shared_ptr<VROARPointCloud> getPointCloud() = 0;
+
+    /*
+     Returns a tightly-packed (stride == width), row-major Y (luma) plane of the
+     camera image.  width and height are set to the plane dimensions.
+     The pointer is valid for the lifetime of this frame object; caller must NOT free it.
+     Returns false if the luma plane is unavailable (platform unsupported, frame not ready).
+     */
+    virtual bool getCameraImageY(const uint8_t** data, int* width, int* height) {
+        (void)data; (void)width; (void)height;
+        return false;
+    }
+
+    /*
+     Get the depth texture for this frame, if available.
+     Returns nullptr if depth is not supported or not enabled.
+     The texture contains depth values in meters as 16-bit unsigned integers
+     (millimeters on ARCore, meters on ARKit).
+     */
+    virtual std::shared_ptr<VROTexture> getDepthTexture() { return nullptr; }
+
+    /*
+     Get the confidence texture for depth values, if available.
+     Returns nullptr if not supported. Values range from 0-255 where
+     higher values indicate higher confidence.
+     */
+    virtual std::shared_ptr<VROTexture> getDepthConfidenceTexture() { return nullptr; }
+
+    /*
+     Check if depth data is available for this frame.
+     */
+    virtual bool hasDepthData() const { return false; }
+
+    /*
+     Get the width of the depth image in pixels.
+     */
+    virtual int getDepthImageWidth() const { return 0; }
+
+    /*
+     Get the height of the depth image in pixels.
+     */
+    virtual int getDepthImageHeight() const { return 0; }
+
+    /**
+     * Generate a triangulated mesh from depth data for physics collision.
+     * The mesh vertices are in world space coordinates.
+     *
+     * @param stride Sample every Nth pixel (1=full resolution, 4=recommended for performance)
+     * @param minConfidence Skip pixels with confidence below this threshold (0.0-1.0)
+     * @param maxDepth Skip pixels with depth beyond this distance in meters
+     * @return Shared pointer to depth mesh, or nullptr if depth data is unavailable
+     */
+    virtual std::shared_ptr<VROARDepthMesh> generateDepthMesh(
+        int stride = 4,
+        float minConfidence = 0.3f,
+        float maxDepth = 5.0f) {
+        return nullptr;
+    }
+
+    /*
+     Returns the transform matrix to convert from camera texture coordinates
+     to depth texture coordinates. The depth map may have a different
+     orientation/resolution than the camera image, so this transform is needed
+     to correctly sample the depth texture.
+
+     By default returns identity (assumes depth texture UVs match camera UVs).
+     */
+    virtual VROMatrix4f getDepthTextureTransform() const {
+        return VROMatrix4f::identity();
+    }
+
+    // ========================================================================
+    // Scene Semantics API
+    // ========================================================================
+
+    /*
+     * Check if semantic data is available for this frame.
+     * Returns true if semantic segmentation data can be retrieved.
+     */
+    virtual bool hasSemanticData() const { return false; }
+
+    /*
+     * Get the semantic image for this frame.
+     * Each pixel contains a label ID (0-11) corresponding to VROSemanticLabel.
+     * Returns an empty/invalid image if semantics is not enabled or data not yet available.
+     */
+    virtual VROSemanticImage getSemanticImage() { return VROSemanticImage(); }
+
+    /*
+     * Get the semantic confidence image for this frame.
+     * Each pixel contains a confidence value (0-255) for the semantic label.
+     * Higher values indicate higher confidence in the classification.
+     * Returns an empty/invalid image if not available.
+     */
+    virtual VROSemanticConfidenceImage getSemanticConfidenceImage() {
+        return VROSemanticConfidenceImage();
+    }
+
+    /*
+     * Get the fraction of pixels with the specified semantic label.
+     * Returns a value in [0.0, 1.0] representing the percentage of pixels
+     * classified with the given label, or 0.0 if not available.
+     */
+    virtual float getSemanticLabelFraction(VROSemanticLabel label) { return 0.0f; }
+
+    /*
+     * Get fractions for all semantic labels in the current frame.
+     * Returns a map of label to fraction (0.0-1.0).
+     */
+    virtual VROSemanticFractions getSemanticFractions() {
+        VROSemanticFractions fractions;
+        for (int i = 0; i < VRO_SEMANTIC_LABEL_COUNT; i++) {
+            VROSemanticLabel label = static_cast<VROSemanticLabel>(i);
+            fractions[label] = getSemanticLabelFraction(label);
+        }
+        return fractions;
+    }
+
+    /*
+     * Get the width of the semantic image in pixels.
+     */
+    virtual int getSemanticImageWidth() const { return 0; }
+
+    /*
+     * Get the height of the semantic image in pixels.
+     */
+    virtual int getSemanticImageHeight() const { return 0; }
 };
 
 #endif /* VROARFrame_h */

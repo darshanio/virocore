@@ -29,6 +29,9 @@
 
 #include <stdint.h>
 #include <arcore_c_api.h>
+#include <functional>
+#include <string>
+#include <memory>
 
 typedef struct AImage AImage;
 
@@ -94,7 +97,9 @@ namespace arcore {
 
     enum class TrackingState {
         NotTracking,
-        Tracking
+        Tracking,
+        Paused,
+        Stopped
     };
 
     enum class TrackingFailureReason {
@@ -114,7 +119,9 @@ namespace arcore {
     enum class TrackableType {
         Image,
         Plane,
-        Point
+        Point,
+        DepthPoint,
+        InstantPlacementPoint
     };
 
     enum class PlaneType {
@@ -125,7 +132,8 @@ namespace arcore {
 
     enum class LightingMode {
         Disabled,
-        AmbientIntensity
+        AmbientIntensity,
+        EnvironmentalHDR
     };
     enum class PlaneFindingMode {
         Disabled,
@@ -141,6 +149,65 @@ namespace arcore {
     enum class FocusMode {
         FIXED_FOCUS,
         AUTO_FOCUS
+    };
+
+    enum class DepthMode {
+        Disabled,
+        Automatic,
+        RawDepthOnly
+    };
+
+    enum class SemanticMode {
+        Disabled,
+        Enabled
+    };
+
+    /*
+     * Semantic labels for scene understanding.
+     * These labels classify pixels in outdoor scenes into semantic categories.
+     * Values match ARCore's ArSemanticLabel enum.
+     */
+    enum class SemanticLabel {
+        Unlabeled = 0,   // Pixel could not be classified
+        Sky = 1,         // Sky regions
+        Building = 2,    // Building structures
+        Tree = 3,        // Trees and large vegetation
+        Road = 4,        // Road surfaces
+        Sidewalk = 5,    // Pedestrian sidewalks
+        Terrain = 6,     // Natural terrain/ground
+        Structure = 7,   // General man-made structures
+        Object = 8,      // Generic objects
+        Vehicle = 9,     // Vehicles (cars, trucks, etc.)
+        Person = 10,     // Human figures
+        Water = 11       // Water bodies
+    };
+
+    // Total number of semantic labels
+    static const int SEMANTIC_LABEL_COUNT = 12;
+
+    enum class GeospatialMode {
+        Disabled,
+        Enabled
+    };
+
+    enum class VPSAvailability {
+        Unknown,
+        Available,
+        Unavailable,
+        ErrorInternal,
+        ErrorNetwork,
+        ErrorResourceExhausted
+    };
+
+    struct GeospatialPoseData {
+        double latitude;
+        double longitude;
+        double altitude;
+        double heading;
+        double horizontalAccuracy;
+        double verticalAccuracy;
+        double orientationYawAccuracy;
+        float quaternion[4];
     };
 
     class Config {
@@ -266,6 +333,48 @@ namespace arcore {
         virtual void getBackgroundTexcoords(float *outTexcoords) = 0;
         virtual PointCloud *acquirePointCloud() = 0;
         virtual ImageRetrievalStatus acquireCameraImage(Image **outImage) = 0;
+
+        /*
+         * Acquire the depth image for this frame.
+         * Returns Success if depth image was acquired, otherwise returns an error status.
+         * The depth image contains 16-bit unsigned integers representing depth in millimeters.
+         * Caller must delete the returned Image when done.
+         */
+        virtual ImageRetrievalStatus acquireDepthImage(Image **outImage) = 0;
+
+        /*
+         * Acquire the depth confidence image for this frame.
+         * Returns Success if confidence image was acquired, otherwise returns an error status.
+         * The confidence image contains 8-bit unsigned integers (0-255).
+         * Caller must delete the returned Image when done.
+         */
+        virtual ImageRetrievalStatus acquireDepthConfidenceImage(Image **outImage) = 0;
+
+        /*
+         * Acquire the semantic image for this frame.
+         * Returns Success if semantic image was acquired, otherwise returns an error status.
+         * The semantic image contains 8-bit unsigned integers representing semantic labels (0-11).
+         * Each pixel value corresponds to a SemanticLabel enum value.
+         * Caller must delete the returned Image when done.
+         */
+        virtual ImageRetrievalStatus acquireSemanticImage(Image **outImage) = 0;
+
+        /*
+         * Acquire the semantic confidence image for this frame.
+         * Returns Success if confidence image was acquired, otherwise returns an error status.
+         * The confidence image contains 8-bit unsigned integers (0-255) representing
+         * the confidence of the semantic label for each pixel.
+         * Caller must delete the returned Image when done.
+         */
+        virtual ImageRetrievalStatus acquireSemanticConfidenceImage(Image **outImage) = 0;
+
+        /*
+         * Get the fraction of pixels with the specified semantic label.
+         * Returns a value in the range [0.0, 1.0] representing the percentage
+         * of pixels classified with the given label.
+         * Returns 0.0 if semantic data is not available.
+         */
+        virtual float getSemanticLabelFraction(SemanticLabel label) = 0;
     };
 
     class PointCloud {
@@ -305,7 +414,23 @@ namespace arcore {
 
         virtual Config *createConfig(LightingMode lightingMode, PlaneFindingMode planeFindingMode,
                                      UpdateMode updateMode, CloudAnchorMode cloudAnchorMode,
-                                     FocusMode focusMode) = 0;
+                                     FocusMode focusMode, DepthMode depthMode, SemanticMode semanticMode,
+                                     GeospatialMode geospatialMode) = 0;
+
+        virtual bool isDepthModeSupported(DepthMode depthMode) = 0;
+        virtual bool isSemanticModeSupported(SemanticMode semanticMode) = 0;
+        virtual bool isGeospatialModeSupported(GeospatialMode mode) = 0;
+        virtual TrackingState getEarthTrackingState() = 0;
+        virtual bool getCameraGeospatialPose(GeospatialPoseData *outPose) = 0;
+        virtual Anchor *createGeospatialAnchor(double latitude, double longitude, double altitude, float qx, float qy, float qz, float qw) = 0;
+        virtual void createTerrainAnchor(double latitude, double longitude, double altitude, float qx, float qy, float qz, float qw,
+                                         std::function<void(Anchor *anchor)> onSuccess,
+                                         std::function<void(std::string error)> onFailure) = 0;
+        virtual void createRooftopAnchor(double latitude, double longitude, double altitude, float qx, float qy, float qz, float qw,
+                                         std::function<void(Anchor *anchor)> onSuccess,
+                                         std::function<void(std::string error)> onFailure) = 0;
+        virtual void checkVpsAvailability(double latitude, double longitude,
+                                          std::function<void(VPSAvailability)> callback) = 0;
 
         virtual AugmentedImageDatabase *createAugmentedImageDatabase() = 0;
         virtual AugmentedImageDatabase *createAugmentedImageDatabase(uint8_t* raw_buffer, int64_t size) = 0;
@@ -319,7 +444,9 @@ namespace arcore {
         virtual HitResult *createHitResult() = 0;
         virtual Anchor *acquireNewAnchor(const Pose *pose) = 0;
         virtual Anchor *hostAndAcquireNewCloudAnchor(const Anchor *anchor, AnchorAcquireStatus *status) = 0;
+        virtual Anchor *hostAndAcquireNewCloudAnchorWithTtl(const Anchor *anchor, int ttlDays, AnchorAcquireStatus *status) = 0;
         virtual Anchor *resolveAndAcquireNewCloudAnchor(const char *anchorId, AnchorAcquireStatus *status) = 0;
+        virtual ArSession *getRawSession() = 0;
     };
 }
 

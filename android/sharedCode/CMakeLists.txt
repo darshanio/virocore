@@ -16,6 +16,7 @@ include_directories(${VIRO_RENDERER_SRC}
                     ${VIRO_CAPI_SRC}
                     ${VIRO_ANDROID_SRC}
                     ${VIRO_ANDROID_SRC}/jni
+                    ${VIRO_ANDROID_SRC}/include        # OpenXR headers (bundled fallback)
                     ${VIRO_ANDROID_INCLUDES}/gvr/include
                     ${VIRO_ANDROID_INCLUDES}/ovr/include
                     ${VIRO_ANDROID_INCLUDES}/freetype/include
@@ -23,6 +24,14 @@ include_directories(${VIRO_RENDERER_SRC}
                     ${VIRO_ANDROID_INCLUDES}/bullet/include
                     ${VIRO_ANDROID_INCLUDES}/opencv/include
                     ${VIRO_ANDROID_INCLUDES}/arcore/include)
+
+# ── OpenXR loader (via Prefab from openxr_loader_for_android AAR) ─────────────
+# AAR is sourced from Khronos GitHub releases (openxr_sdk/maven local repo).
+# Prefab package name: OpenXR  |  module: openxr_loader
+# Requires buildFeatures { prefab true } in viroreact/build.gradle
+find_package(OpenXR REQUIRED CONFIG)
+set(OPENXR_LINK_LIB OpenXR::openxr_loader)
+message(STATUS "OpenXR loader: FOUND via Prefab (OpenXR::openxr_loader)")
 
 # Creates and names a library, sets it as either STATIC
 # or SHARED, and provides the relative paths to its source code.
@@ -46,6 +55,7 @@ add_library( # Sets the name of the library.
              ${VIRO_ANDROID_SRC}/VROSceneRenderer.cpp
              ${VIRO_ANDROID_SRC}/VROSceneRendererGVR.cpp
              ${VIRO_ANDROID_SRC}/VROSceneRendererOVR.cpp
+             ${VIRO_ANDROID_SRC}/VROSceneRendererOpenXR.cpp
              ${VIRO_ANDROID_SRC}/VROSceneRendererSceneView.cpp
              ${VIRO_ANDROID_SRC}/VROSample.cpp
              ${VIRO_ANDROID_SRC}/VROImageAndroid.cpp
@@ -56,6 +66,7 @@ add_library( # Sets the name of the library.
              ${VIRO_ANDROID_SRC}/VROInputControllerDaydream.cpp
              ${VIRO_ANDROID_SRC}/VROInputControllerCardboard.cpp
              ${VIRO_ANDROID_SRC}/VROInputControllerOVR.cpp
+             ${VIRO_ANDROID_SRC}/VROInputControllerOpenXR.cpp
              ${VIRO_ANDROID_SRC}/VROAVRecorderAndroid.cpp
              ${VIRO_ANDROID_SRC}/VROTextureReader.cpp
              ${VIRO_ANDROID_SRC}/VROAndroidViewTexture.cpp
@@ -224,6 +235,8 @@ add_library( # Sets the name of the library.
              ${VIRO_ANDROID_SRC}/arcore/VROARHitTestResultARCore.cpp
              ${VIRO_ANDROID_SRC}/arcore/VROYuvImageConverter.cpp
              ${VIRO_ANDROID_SRC}/arcore/VROCloudAnchorProviderARCore.cpp
+             ${VIRO_ANDROID_SRC}/arcore/VROCloudAnchorProviderReactVision.cpp
+             ${VIRO_ANDROID_SRC}/arcore/VROARFrameSnapshot.cpp
              ${VIRO_ANDROID_SRC}/arcore/ARUtils_JNI.cpp
              ${VIRO_ANDROID_SRC}/arcore/ARNode_JNI.cpp
              ${VIRO_ANDROID_SRC}/arcore/ARDeclarativeNode_JNI.cpp
@@ -313,6 +326,8 @@ add_library( # Sets the name of the library.
              ${VIRO_RENDERER_SRC}/VROPhysicsWorld.cpp
              ${VIRO_RENDERER_SRC}/VROPhysicsBody.cpp
              ${VIRO_RENDERER_SRC}/VROPhysicsShape.cpp
+             ${VIRO_RENDERER_SRC}/VROARDepthMesh.cpp
+             ${VIRO_RENDERER_SRC}/VROARWorldMesh.cpp
 
              # Android JNI
              ${VIRO_ANDROID_SRC}/jni/VRORenderer_JNI.cpp
@@ -386,7 +401,7 @@ add_library( lib-freetype
              IMPORTED )
 set_target_properties( lib-freetype
                        PROPERTIES IMPORTED_LOCATION
-                       ${VIRO_ANDROID_LIBS}/${ANDROID_ABI}/libfreetyped.so )
+                       ${VIRO_ANDROID_LIBS}/${ANDROID_ABI}/libfreetype.so )
 
 add_library( lib-protobuf
              STATIC
@@ -422,6 +437,33 @@ add_library( lib-LinearMath
 set_target_properties( lib-LinearMath
                        PROPERTIES IMPORTED_LOCATION
                        ${VIRO_ANDROID_LIBS}/${ANDROID_ABI}/libLinearMath.so )
+
+# ── ReactVisionCCA — optional prebuilt proprietary cloud anchor library ───────
+# ReactVisionCCA is built independently (private repo) and deployed to jniLibs/
+# before building ViroCore.  It is OPTIONAL: open-source builds without the .so
+# compile stub implementations that report the feature as unavailable.
+#
+# To enable: run reactvisioncca/scripts/build_android.sh and copy the .so files
+# to android/sharedCode/src/main/jniLibs/{abi}/ before building ViroCore.
+
+set(RVCCA_DIR "${CMAKE_SOURCE_DIR}/../../../reactvisioncca")
+set(RVCCA_SO  "${VIRO_ANDROID_LIBS}/${ANDROID_ABI}/libreactvisioncca.so")
+set(RVCCA_HDR "${RVCCA_DIR}/include/ReactVisionCCA/RVCCACloudAnchorProvider.h")
+
+if(EXISTS "${RVCCA_SO}" AND EXISTS "${RVCCA_HDR}")
+    message(STATUS "ReactVisionCCA: FOUND — ReactVision Cloud Anchors ENABLED")
+    include_directories("${RVCCA_DIR}/include")
+    add_library(lib-reactvisioncca SHARED IMPORTED)
+    set_target_properties(lib-reactvisioncca PROPERTIES
+                          IMPORTED_LOCATION "${RVCCA_SO}")
+    set(RVCCA_LINK_LIB lib-reactvisioncca)
+    add_compile_definitions(RVCCA_AVAILABLE=1)
+else()
+    message(STATUS "ReactVisionCCA: NOT FOUND — ReactVision Cloud Anchors DISABLED "
+                   "(deploy libreactvisioncca.so to jniLibs/ to enable)")
+    set(RVCCA_LINK_LIB "")
+    add_compile_definitions(RVCCA_AVAILABLE=0)
+endif()
 
 # Searches for a specified prebuilt library and stores the path as a
 # variable. Because system libraries are included in the search path by
@@ -465,6 +507,10 @@ target_link_libraries( # Specifies the target library.
                        lib-BulletSoftBody
                        lib-LinearMath
 
+                       ${RVCCA_LINK_LIB}
+                       ${OPENXR_LINK_LIB}
+
                        cpufeatures
                        ${lib-z}
+                       "-Wl,-z,max-page-size=16384"
         )

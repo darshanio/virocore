@@ -50,10 +50,10 @@ struct VROShaderCapabilities;
  */
 class VROShaderFactory {
 public:
-       
+
     VROShaderFactory();
     virtual ~VROShaderFactory();
-    
+
     /*
      Purge all shaders that are no longer used. If force is true, then we
      disregard time. If force is false, we only purge as many as we can
@@ -61,7 +61,7 @@ public:
      purged, and false if we ran out of time.
      */
     bool purgeUnusedShaders(const VROFrameTimer &timer, bool force);
-    
+
     /*
      Retrieve a shader that has the given material and lighting capabilities.
      If the shader is not cached, it will be created. The modifiers are required
@@ -71,7 +71,35 @@ public:
                                                 VROLightingShaderCapabilities lightingCapabilities,
                                                 const std::vector<std::shared_ptr<VROShaderModifier>> &modifiers,
                                                 std::shared_ptr<VRODriverOpenGL> &driver);
-    
+
+    /*
+     Creates a shader modifier for AR occlusion that writes depth from the
+     AR framework's depth texture to the depth buffer during background rendering.
+     */
+    static std::shared_ptr<VROShaderModifier> createOcclusionDepthModifier();
+
+    /*
+     Creates a shader modifier for virtual objects that discards fragments
+     where the object is behind real-world surfaces (based on AR depth texture).
+     */
+    static std::shared_ptr<VROShaderModifier> createOcclusionMaskModifier();
+
+    /*
+     Creates a shader modifier that visualizes the depth texture as a color overlay
+     on the camera background for debugging purposes. Near objects appear red,
+     far objects appear blue, with a gradient in between.
+     */
+    static std::shared_ptr<VROShaderModifier> createDepthDebugModifier();
+
+    /*
+     Creates a shader modifier that visualizes the semantic segmentation texture as a
+     color overlay on the camera background for debugging purposes. Each real-world label
+     category is mapped to a distinct color: sky=light-blue, building=gray, tree=green,
+     road=dark-gray, sidewalk=tan, terrain=brown, structure=orange, object=yellow,
+     vehicle=red, person=magenta, water=blue. Unlabeled pixels show the camera feed unchanged.
+     */
+    static std::shared_ptr<VROShaderModifier> createSemanticDebugModifier();
+
 private:
     
     /*
@@ -117,7 +145,7 @@ private:
     std::shared_ptr<VROShaderModifier> createPostProcessMaskModifier();
     std::shared_ptr<VROShaderModifier> createToneMappingMaskModifier();
     std::vector<std::string> createColorLinearizationCode();
-    
+
 };
 
 #endif /* VROShaderFactory_h */

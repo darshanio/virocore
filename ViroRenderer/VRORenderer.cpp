@@ -312,6 +312,54 @@ void VRORenderer::setClearColor(VROVector4f color, std::shared_ptr<VRODriver> dr
     }
 }
 
+void VRORenderer::setOcclusionMode(VROOcclusionMode mode) {
+    if (_context) {
+        _context->setOcclusionMode(mode);
+    }
+}
+
+void VRORenderer::setDepthTexture(std::shared_ptr<VROTexture> depthTexture) {
+    if (_context) {
+        _context->setDepthTexture(depthTexture);
+    }
+}
+
+void VRORenderer::setDepthTextureTransform(VROMatrix4f transform) {
+    if (_context) {
+        _context->setDepthTextureTransform(transform);
+    }
+}
+
+void VRORenderer::setSemanticTextureTransform(VROMatrix4f transform) {
+    if (_context) {
+        _context->setSemanticTextureTransform(transform);
+    }
+}
+
+void VRORenderer::setCameraBackgroundTexture(std::shared_ptr<VROTexture> texture) {
+    if (_context) {
+        _context->setCameraBackgroundTexture(texture);
+    }
+}
+
+void VRORenderer::setSemanticTexture(std::shared_ptr<VROTexture> texture) {
+    if (_context) {
+        _context->setSemanticTexture(texture);
+    }
+}
+
+void VRORenderer::setSemanticConfidenceTexture(std::shared_ptr<VROTexture> texture) {
+    if (_context) {
+        _context->setSemanticConfidenceTexture(texture);
+    }
+}
+
+void VRORenderer::setCameraImageTransform(VROMatrix4f transform) {
+    if (_context) {
+        _context->setCameraImageTransform(transform);
+    }
+}
+
 VROCamera VRORenderer::updateCamera(const VROViewport &viewport, const VROFieldOfView &fov,
                                     const VROMatrix4f &headRotation, const VROMatrix4f &projection) {
     
@@ -442,11 +490,12 @@ void VRORenderer::prepareFrame(int frame, VROViewport viewport, VROFieldOfView f
     _context->setEnclosureViewMatrix(enclosureMatrix);
     
     /*
-     Orthographic matrix is used for objects that are rendered in screen coordinates. 
+     Orthographic matrix is used for objects that are rendered in screen coordinates.
      We use zero for the NCP since typically orthographic objects will have no Z
      coordinate (e.g., Z=0).
      */
     _context->setOrthographicMatrix(viewport.getOrthographicProjection(0, kZFar));
+    _context->setViewport(viewport);
     _context->setShadowMap(nullptr);
     
     _renderMetadata = std::make_shared<VRORenderMetadata>();

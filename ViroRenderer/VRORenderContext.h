@@ -36,6 +36,8 @@
 #include "VROQuaternion.h"
 #include "VROCamera.h"
 #include "VROFrameScheduler.h"
+#include "VROARSession.h"
+#include "VROViewport.h"
 
 class VROFrameSynchronizer;
 class VROTexture;
@@ -196,6 +198,85 @@ public:
         return _pbrEnabled;
     }
 
+    /*
+     Occlusion support - depth texture from AR framework for real-world occlusion.
+     */
+    void setDepthTexture(std::shared_ptr<VROTexture> depthTexture) {
+        _depthTexture = depthTexture;
+    }
+    std::shared_ptr<VROTexture> getDepthTexture() const {
+        return _depthTexture;
+    }
+
+    void setSceneDepthTexture(std::shared_ptr<VROTexture> texture) {
+        _sceneDepthTexture = texture;
+    }
+    std::shared_ptr<VROTexture> getSceneDepthTexture() const {
+        return _sceneDepthTexture;
+    }
+
+    void setCameraBackgroundTexture(std::shared_ptr<VROTexture> texture) {
+        _cameraBackgroundTexture = texture;
+    }
+    std::shared_ptr<VROTexture> getCameraBackgroundTexture() const {
+        return _cameraBackgroundTexture;
+    }
+
+    void setSemanticTexture(std::shared_ptr<VROTexture> texture) {
+        _semanticTexture = texture;
+    }
+    std::shared_ptr<VROTexture> getSemanticTexture() const {
+        return _semanticTexture;
+    }
+
+    void setSemanticConfidenceTexture(std::shared_ptr<VROTexture> texture) {
+        _semanticConfidenceTexture = texture;
+    }
+    std::shared_ptr<VROTexture> getSemanticConfidenceTexture() const {
+        return _semanticConfidenceTexture;
+    }
+
+    void setCameraImageTransform(VROMatrix4f transform) {
+        _cameraImageTransform = transform;
+    }
+    VROMatrix4f getCameraImageTransform() const {
+        return _cameraImageTransform;
+    }
+
+    void setDepthTextureTransform(VROMatrix4f transform) {
+        _depthTextureTransform = transform;
+    }
+    VROMatrix4f getDepthTextureTransform() const {
+        return _depthTextureTransform;
+    }
+
+    void setSemanticTextureTransform(VROMatrix4f transform) {
+        _semanticTextureTransform = transform;
+    }
+    VROMatrix4f getSemanticTextureTransform() const {
+        return _semanticTextureTransform;
+    }
+
+    void setOcclusionMode(VROOcclusionMode mode) {
+        _occlusionMode = mode;
+    }
+    VROOcclusionMode getOcclusionMode() const {
+        return _occlusionMode;
+    }
+
+    bool isOcclusionEnabled() const {
+        return (_occlusionMode == VROOcclusionMode::DepthBased ||
+                _occlusionMode == VROOcclusionMode::PeopleOnly)
+               && _depthTexture != nullptr;
+    }
+
+    void setViewport(VROViewport viewport) {
+        _viewport = viewport;
+    }
+    VROViewport getViewport() const {
+        return _viewport;
+    }
+
 private:
     
     int _frame;
@@ -272,6 +353,65 @@ private:
      The input controller being used.
      */
     std::shared_ptr<VROInputControllerBase> _inputController;
+
+    /*
+     Depth texture from AR framework for occlusion.
+     */
+    std::shared_ptr<VROTexture> _depthTexture;
+
+    /*
+     Scene depth texture captured from the previous frame's base render pass.
+     Null for the first frame or when HDR rendering is disabled.
+     Sampled as raw depth values (no PCF compare mode).
+     */
+    std::shared_ptr<VROTexture> _sceneDepthTexture;
+
+    /*
+     Live AR camera background texture. On Android this is GL_TEXTURE_EXTERNAL_OES;
+     on iOS it is a standard GL_TEXTURE_2D. Null when no AR session is active.
+     */
+    std::shared_ptr<VROTexture> _cameraBackgroundTexture;
+
+    /*
+     Semantic segmentation texture (R8, per-pixel label 0-11 = VROSemanticLabel).
+     Updated each frame when semantic mode is enabled. Null when not available.
+     */
+    std::shared_ptr<VROTexture> _semanticTexture;
+
+    /*
+     Per-pixel confidence for the semantic label (R8, 0=uncertain, 255=certain).
+     Updated each frame alongside _semanticTexture. When not provided by the platform
+     (e.g. iOS), a 1×1 all-white texture is used so the shader always reads conf=1.0.
+     */
+    std::shared_ptr<VROTexture> _semanticConfidenceTexture;
+
+    /*
+     Transform mapping viewport UV coordinates to camera image UV coordinates.
+     This accounts for device orientation and camera crop/zoom.
+     */
+    VROMatrix4f _cameraImageTransform;
+
+    /*
+     Transform to convert from screen UV to depth texture UV.
+     */
+    VROMatrix4f _depthTextureTransform;
+
+    /*
+     Transform to convert from GL screen UV (y=0 bottom) to semantic texture UV.
+     Equals getViewportToCameraImageTransform() converted to GL convention.
+     Valid on both iOS (ARCore semantics) and Android (ARCore semantics).
+     */
+    VROMatrix4f _semanticTextureTransform;
+
+    /*
+     Current occlusion mode.
+     */
+    VROOcclusionMode _occlusionMode = VROOcclusionMode::Disabled;
+
+    /*
+     Current viewport dimensions.
+     */
+    VROViewport _viewport;
 
 };
 

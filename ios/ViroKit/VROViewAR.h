@@ -114,4 +114,78 @@ enum class VROCameraPosition;
  */
 - (void)setDebugDrawDelegate:(NSObject<VRODebugDrawDelegate> *)debugDrawDelegate;
 
+/*
+ Enable or disable depth debug visualization. When enabled, the depth texture
+ from ARKit will be rendered as a color overlay on the camera feed:
+ - Red = close objects (0-1 meters)
+ - Yellow = medium distance (1-3 meters)
+ - Green = medium-far (3-5 meters)
+ - Cyan = far (5-10 meters)
+ - Blue = very far (10+ meters)
+ - Black = no depth data
+
+ @param enabled Whether to enable depth debug visualization
+ @param opacity The opacity of the depth overlay (0.0 = camera only, 1.0 = depth only)
+ */
+- (void)setDepthDebugEnabled:(BOOL)enabled opacity:(float)opacity;
+
+/*
+ Enable or disable semantic segmentation debug visualization. When enabled, the camera
+ background shows a color overlay where each real-world category is mapped to a distinct
+ color: sky=light-blue, building=gray, tree=green, road=dark-gray, sidewalk=tan,
+ terrain=brown, structure=orange, object=yellow, vehicle=red, person=magenta, water=blue.
+ Requires semantic mode to be enabled via setSemanticModeEnabled.
+
+ @param enabled Whether to enable the semantic debug overlay
+ */
+- (void)setSemanticDebugEnabled:(BOOL)enabled;
+
+#pragma mark - Monocular Depth Estimation
+
+/*
+ Enable or disable monocular depth estimation for devices without LiDAR.
+ When enabled, the system will use a neural network to estimate depth from
+ the camera image. This provides depth-based occlusion on older devices.
+
+ Note: The depth model must be bundled with the app as DepthPro.mlmodelc.
+
+ @param enabled Whether to enable monocular depth estimation
+ */
+- (void)setMonocularDepthEnabled:(BOOL)enabled;
+
+/*
+ Check if monocular depth estimation is supported on this device.
+ Requires iOS 14.0+ and sufficient GPU/Neural Engine capabilities.
+
+ @return YES if supported, NO otherwise
+ */
+- (BOOL)isMonocularDepthSupported;
+
+/*
+ Check if the monocular depth model is available (bundled in framework or app).
+
+ @return YES if the model is available, NO otherwise
+ */
+- (BOOL)isMonocularDepthModelAvailable;
+
+/*
+ When enabled, monocular depth estimation will be used even on devices with LiDAR.
+ This allows using the neural network-based depth on all devices for:
+ - Consistency across device types
+ - Testing/comparison purposes
+ - Getting depth estimates beyond LiDAR's ~5m range
+
+ Default is NO (LiDAR is preferred when available).
+
+ @param prefer Whether to prefer monocular depth over LiDAR
+ */
+- (void)setPreferMonocularDepth:(BOOL)prefer;
+
+/*
+ Check if monocular depth is preferred over LiDAR.
+
+ @return YES if monocular depth is preferred, NO otherwise
+ */
+- (BOOL)isPreferMonocularDepth;
+
 @end

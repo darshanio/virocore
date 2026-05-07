@@ -179,6 +179,11 @@ namespace arcore {
         virtual void getBackgroundTexcoords(float *outTexcoords);
         virtual PointCloud *acquirePointCloud();
         virtual ImageRetrievalStatus acquireCameraImage(Image **outImage);
+        virtual ImageRetrievalStatus acquireDepthImage(Image **outImage);
+        virtual ImageRetrievalStatus acquireDepthConfidenceImage(Image **outImage);
+        virtual ImageRetrievalStatus acquireSemanticImage(Image **outImage);
+        virtual ImageRetrievalStatus acquireSemanticConfidenceImage(Image **outImage);
+        virtual float getSemanticLabelFraction(SemanticLabel label);
 
         ArFrame *_frame;
         ArSession *_session;
@@ -234,7 +239,22 @@ namespace arcore {
 
         virtual Config *createConfig(LightingMode lightingMode, PlaneFindingMode planeFindingMode,
                                      UpdateMode updateMode, CloudAnchorMode cloudAnchorMode,
-                                     FocusMode focusMode);
+                                     FocusMode focusMode, DepthMode depthMode, SemanticMode semanticMode,
+                                     GeospatialMode geospatialMode);
+        virtual bool isDepthModeSupported(DepthMode depthMode);
+        virtual bool isSemanticModeSupported(SemanticMode semanticMode);
+        virtual bool isGeospatialModeSupported(GeospatialMode mode);
+        virtual TrackingState getEarthTrackingState();
+        virtual bool getCameraGeospatialPose(GeospatialPoseData *outPose);
+        virtual Anchor *createGeospatialAnchor(double latitude, double longitude, double altitude, float qx, float qy, float qz, float qw);
+        virtual void createTerrainAnchor(double latitude, double longitude, double altitude, float qx, float qy, float qz, float qw,
+                                         std::function<void(Anchor *anchor)> onSuccess,
+                                         std::function<void(std::string error)> onFailure);
+        virtual void createRooftopAnchor(double latitude, double longitude, double altitude, float qx, float qy, float qz, float qw,
+                                         std::function<void(Anchor *anchor)> onSuccess,
+                                         std::function<void(std::string error)> onFailure);
+        virtual void checkVpsAvailability(double latitude, double longitude,
+                                          std::function<void(VPSAvailability)> callback);
         virtual AugmentedImageDatabase *createAugmentedImageDatabase();
         virtual AugmentedImageDatabase *createAugmentedImageDatabase(uint8_t* raw_buffer, int64_t size);
         virtual Pose *createPose();
@@ -247,7 +267,9 @@ namespace arcore {
         virtual HitResult *createHitResult();
         virtual Anchor *acquireNewAnchor(const Pose *pose);
         virtual Anchor *hostAndAcquireNewCloudAnchor(const Anchor *anchor, AnchorAcquireStatus *status);
+        virtual Anchor *hostAndAcquireNewCloudAnchorWithTtl(const Anchor *anchor, int ttlDays, AnchorAcquireStatus *status);
         virtual Anchor *resolveAndAcquireNewCloudAnchor(const char *anchorId, AnchorAcquireStatus *status);
+        virtual ArSession *getRawSession() { return _session; }
 
     private:
         ArSession *_session;

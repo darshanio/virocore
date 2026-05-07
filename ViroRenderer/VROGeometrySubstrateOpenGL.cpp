@@ -214,7 +214,8 @@ void VROGeometrySubstrateOpenGL::createVAO() {
             GL( glBindBuffer(GL_ARRAY_BUFFER, vd.buffer) );
     
             for (int i = 0; i < vd.numAttributes; i++) {
-                if (vd.attributes[i].type == GL_INT || vd.attributes[i].type == GL_SHORT) {
+                if (vd.attributes[i].type == GL_INT || vd.attributes[i].type == GL_SHORT ||
+                    vd.attributes[i].type == GL_UNSIGNED_BYTE || vd.attributes[i].type == GL_UNSIGNED_SHORT) {
                     GL( glVertexAttribIPointer(vd.attributes[i].index, vd.attributes[i].size, vd.attributes[i].type, vd.stride,
                                                (GLvoid *) vd.attributes[i].offset) );
                 }
@@ -248,8 +249,10 @@ std::pair<GLuint, int> VROGeometrySubstrateOpenGL::parseVertexFormat(std::shared
     }
     else {
         switch (source->getBytesPerComponent()) {
+            case 1:
+                return { GL_UNSIGNED_BYTE, source->getComponentsPerVertex() };
             case 2:
-                return { GL_SHORT, source->getComponentsPerVertex() };
+                return { GL_UNSIGNED_SHORT, source->getComponentsPerVertex() };
             case 4:
                 return { GL_INT, source->getComponentsPerVertex() };
             default:
@@ -322,7 +325,7 @@ void VROGeometrySubstrateOpenGL::render(const VROGeometry &geometry,
     VROGeometryElementOpenGL element = _elements[elementIndex];
     VROMaterialSubstrateOpenGL *substrate = static_cast<VROMaterialSubstrateOpenGL *>(material->getSubstrate(driver));
     substrate->bindView(transform, viewMatrix, projectionMatrix, normalMatrix,
-                        context.getCamera().getPosition(), context.getEyeType());
+                        context.getCamera().getPosition(), context.getEyeType(), context);
     
     passert (elementIndex < _vaos.size() && elementIndex >= 0);
     GL (glBindVertexArray(_vaos[elementIndex]) );
@@ -356,6 +359,12 @@ void VROGeometrySubstrateOpenGL::renderMaterial(const VROGeometry &geometry,
 
         const std::shared_ptr<VROTexture> &texture = reference.getTexture(context);
 
+        if (!texture) {
+            // Skip null textures (e.g., AR depth when not available)
+            ++activeTexture;
+            continue;
+        }
+
         for (int s = 0; s < texture->getNumSubstrates(); s++) {
             VROTextureSubstrateOpenGL *substrate = (VROTextureSubstrateOpenGL *) texture->getSubstrate(s, driver, false);
             if (!substrate) {
@@ -364,8 +373,9 @@ void VROGeometrySubstrateOpenGL::renderMaterial(const VROGeometry &geometry,
                 std::shared_ptr<VROTexture> blank = getBlankTexture(texture->getType());
                 substrate = (VROTextureSubstrateOpenGL *) blank->getSubstrate(0, driver, true);
             }
-            
+
             std::pair<GLenum, GLuint> targetAndTexture = substrate->getTexture();
+
             driver->bindTexture(GL_TEXTURE0 + activeTexture, targetAndTexture.first, targetAndTexture.second);
             ++activeTexture;
         }
@@ -411,8 +421,8 @@ void VROGeometrySubstrateOpenGL::renderSilhouette(const VROGeometry &geometry,
         
         VROMaterialSubstrateOpenGL *substrate = static_cast<VROMaterialSubstrateOpenGL *>(material->getSubstrate(driver));
         substrate->bindView(transform, viewMatrix, projectionMatrix, normalMatrix,
-                            context.getCamera().getPosition(), context.getEyeType());
-        
+                            context.getCamera().getPosition(), context.getEyeType(), context);
+
         GL( glBindVertexArray(_vaos[i]) );
         substrate->bindGeometry(1.0, geometry);
         GL( glDrawElements(element.primitiveType, element.indexCount, element.indexType, 0) );
@@ -449,11 +459,11 @@ void VROGeometrySubstrateOpenGL::renderSilhouetteTextured(const VROGeometry &geo
     VROGeometryElementOpenGL &element = _elements[elementIndex];
     VROMaterialSubstrateOpenGL *substrate = static_cast<VROMaterialSubstrateOpenGL *>(material->getSubstrate(driver));
     substrate->bindView(transform, viewMatrix, projectionMatrix, normalMatrix,
-                        context.getCamera().getPosition(), context.getEyeType());
-    
+                        context.getCamera().getPosition(), context.getEyeType(), context);
+
     GL( glBindVertexArray(_vaos[elementIndex]) );
     renderMaterial(geometry, material, substrate, element, 1.0, context, driver);
     GL( glBindVertexArray(0) );
-    
+
     pglpop();
 }

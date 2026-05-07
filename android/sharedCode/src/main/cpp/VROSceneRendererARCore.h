@@ -37,6 +37,7 @@
 #include <arcore/VROARSessionARCore.h>
 #include "VROSceneRenderer.h"
 #include "VRODriverOpenGLAndroid.h"
+#include "VROShaderFactory.h"
 
 #include "vr/gvr/capi/include/gvr_audio.h"
 #include "vr/gvr/capi/include/gvr_types.h"
@@ -46,6 +47,7 @@ class VROARCamera;
 class VROARFrame;
 class VRORendererConfiguration;
 class VROARSessionARCore;
+class VROShaderModifier;
 
 class VROSceneRendererARCore : public VROSceneRenderer, public std::enable_shared_from_this<VROSceneRendererARCore> {
 
@@ -95,7 +97,7 @@ public:
      */
     void onSurfaceCreated(jobject surface) {}
     void onSurfaceChanged(jobject surface, VRO_INT width, VRO_INT height);
-    void onSurfaceDestroyed() {}
+    void onSurfaceDestroyed();
 
     /*
      Set to true when ARCore is installed. Unlocks the renderer.
@@ -146,17 +148,38 @@ public:
      */
     void enableTracking(bool shouldTrack);
 
+    /*
+     Enable/disable semantic segmentation debug overlay on the camera background.
+     When enabled, the camera feed shows a color overlay for each semantic label.
+     */
+    void setSemanticDebugEnabled(bool enabled);
+
+    /*
+     Set the confidence threshold (0.0–1.0) below which semantic labels are
+     discarded (set to unlabeled = 0) to reduce boundary noise/blinking.
+     */
+    void setSemanticConfidenceThreshold(float threshold);
+
 private:
 
+    void updateBackgroundSemanticsDebug();
     void renderFrame();
     void renderWithTracking(const std::shared_ptr<VROARCamera> &camera, const std::unique_ptr<VROARFrame> &frame,
                             VROViewport viewport);
     void updateARBackground(std::unique_ptr<VROARFrame> &frame, bool forceReset);
+    void updateBackgroundOcclusion(std::unique_ptr<VROARFrame> &frame);
     void renderWaitingForTracking(VROViewport viewport);
     void renderNothing();
     void initARSession(VROViewport viewport, std::shared_ptr<VROScene> scene);
 
     std::shared_ptr<VROSurface> _cameraBackground;
+    bool _occlusionModifierAdded = false;
+    bool _semanticDebugEnabled = false;
+    bool _semanticDebugModifierAdded = false;
+    std::shared_ptr<VROShaderModifier> _semanticDebugModifier;
+    VROMatrix4f _semanticTextureTransform;
+    VROViewport _lastViewport;
+    VROOcclusionMode _lastOcclusionMode = VROOcclusionMode::Disabled;
     gvr::Sizei _surfaceSize;
     bool _arcoreInstalled;
     bool _destroyed;

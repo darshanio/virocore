@@ -30,6 +30,7 @@
 #if __IPHONE_OS_VERSION_MAX_ALLOWED >= 110000
 #include "VROARFrame.h"
 #include "VROViewport.h"
+#include "VROARDepthMesh.h"
 #include <ARKit/ARKit.h>
 
 class VROARSessioniOS;
@@ -43,6 +44,11 @@ public:
     
     CVPixelBufferRef getImage() const;
     CGImagePropertyOrientation getImageOrientation() const;
+
+    /*
+     Returns the underlying ARKit ARFrame.
+     */
+    ARFrame *getARFrame() const { return _frame; }
 
     double getTimestamp() const;
     VROCameraOrientation getOrientation() const { return _orientation; }
@@ -64,9 +70,41 @@ public:
     VROVector3f getAmbientLightColor() const;
 
     std::shared_ptr<VROARPointCloud> getPointCloud();
-    
+    bool getCameraImageY(const uint8_t** data, int* width, int* height) override;
+
+    // Depth data support (iOS 14.0+ with LiDAR)
+    std::shared_ptr<VROTexture> getDepthTexture() override;
+    std::shared_ptr<VROTexture> getDepthConfidenceTexture() override;
+    bool hasDepthData() const override;
+    int getDepthImageWidth() const override;
+    int getDepthImageHeight() const override;
+
+    /*
+     Returns true if native LiDAR depth is available from ARKit.
+     This is distinct from hasDepthData() which may return true
+     for monocular depth estimation when LiDAR is not available.
+     */
+    bool hasLiDARDepth() const;
+
+    /*
+     Returns the transform matrix to convert from camera texture coordinates
+     to depth texture coordinates. The depth map from ARKit may have a different
+     orientation/resolution than the camera image, so this transform is needed
+     to correctly sample the depth texture.
+     */
+    VROMatrix4f getDepthTextureTransform() const;
+
+    // Scene Semantics support (requires ARCore SDK with Semantics extension)
+    float getSemanticLabelFraction(VROSemanticLabel label) override;
+
+    // Depth mesh generation for physics collision
+    std::shared_ptr<VROARDepthMesh> generateDepthMesh(
+        int stride = 4,
+        float minConfidence = 0.3f,
+        float maxDepth = 5.0f) override;
+
 private:
-    
+
     ARFrame *_frame;
     VROViewport _viewport;
     VROCameraOrientation _orientation;
@@ -74,7 +112,21 @@ private:
     std::shared_ptr<VROARCamera> _camera;
     std::vector<std::shared_ptr<VROARAnchor>> _anchors;
     std::shared_ptr<VROARPointCloud> _pointCloud;
-    
+
+    // Cached depth textures (mutable to allow lazy initialization in const methods)
+    mutable std::shared_ptr<VROTexture> _depthTexture;
+    mutable std::shared_ptr<VROTexture> _depthConfidenceTexture;
+
+    // Cached tightly-packed Y plane (acquired lazily via getCameraImageY)
+    mutable std::vector<uint8_t> _lumaData;
+    mutable int _lumaW = 0, _lumaH = 0;
+
+    /*
+     Sample depth texture at normalized UV coordinates (0-1 range).
+     Returns depth value in meters, or 0.0 if invalid.
+     */
+    float sampleDepthTextureAtUV(std::shared_ptr<VROTexture> texture, float u, float v) const;
+
 };
 
 #endif

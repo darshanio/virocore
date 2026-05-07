@@ -52,6 +52,10 @@
 #include "VROInputControllerCardboard.h"
 #include "VROAllocationTracker.h"
 #include "VROInputControllerARAndroid.h"
+#include "VROShaderModifier.h"
+#include "VROShaderFactory.h"
+#include "VROMaterial.h"
+#include "VROUniform.h"
 
 static VROVector3f const kZeroVector = VROVector3f();
 
@@ -77,7 +81,10 @@ VROSceneRendererARCore::VROSceneRendererARCore(VRORendererConfiguration config,
 }
 
 VROSceneRendererARCore::~VROSceneRendererARCore() {
-
+    // Ensure cleanup happens even if onDestroy wasn't called
+    if (!_destroyed) {
+        onDestroy();
+    }
 }
 
 #pragma mark - Rendering
@@ -160,19 +167,64 @@ void VROSceneRendererARCore::renderFrame() {
 
 void VROSceneRendererARCore::updateARBackground(std::unique_ptr<VROARFrame> &frame,
                                                 bool forceReset) {
-    // Only update the rendered camera background if need be.
-    if (!forceReset && !((VROARFrameARCore *) frame.get())->hasDisplayGeometryChanged()) {
-        return;
+    // Check if occlusion mode has changed - if so, force update
+    VROOcclusionMode currentOcclusionMode = _session->getOcclusionMode();
+    bool occlusionModeChanged = (currentOcclusionMode != _lastOcclusionMode);
+    if (occlusionModeChanged) {
+        _lastOcclusionMode = currentOcclusionMode;
+        forceReset = true;
     }
 
-    VROVector3f BL, BR, TL, TR;
-    ((VROARFrameARCore *)frame.get())->getBackgroundTexcoords(&BL, &BR, &TL, &TR);
+    bool geometryChanged = ((VROARFrameARCore *) frame.get())->hasDisplayGeometryChanged();
 
-    _cameraBackground->setTextureCoordinates(BL, BR, TL, TR);
+    // Only update texture coordinates if geometry changed or forced
+    if (forceReset || geometryChanged) {
+        VROVector3f BL, BR, TL, TR;
+        ((VROARFrameARCore *)frame.get())->getBackgroundTexcoords(&BL, &BR, &TL, &TR);
 
-    // Wait until we have these proper texture coordinates before installing the background
-    if (!_sceneController->getScene()->getRootNode()->getBackground()) {
-        _sceneController->getScene()->getRootNode()->setBackground(_cameraBackground);
+        _cameraBackground->setTextureCoordinates(BL, BR, TL, TR);
+
+        // Wait until we have these proper texture coordinates before installing the background
+        if (!_sceneController->getScene()->getRootNode()->getBackground()) {
+            _sceneController->getScene()->getRootNode()->setBackground(_cameraBackground);
+        }
+    }
+
+    // Always update occlusion settings if occlusion mode changed, even if geometry didn't change
+    if (occlusionModeChanged || forceReset || geometryChanged) {
+        updateBackgroundOcclusion(frame);
+    }
+}
+
+void VROSceneRendererARCore::updateBackgroundOcclusion(std::unique_ptr<VROARFrame> &frame) {
+    std::shared_ptr<VROMaterial> material = _cameraBackground->getMaterials()[0];
+    VROOcclusionMode occlusionMode = _session->getOcclusionMode();
+
+    // Check if we have depth data available
+    bool hasDepth = frame->hasDepthData();
+    std::shared_ptr<VROTexture> depthTexture = hasDepth ? frame->getDepthTexture() : nullptr;
+
+    bool shouldApplyOcclusionRendering =
+        (occlusionMode == VROOcclusionMode::DepthBased ||
+         occlusionMode == VROOcclusionMode::PeopleOnly) && depthTexture != nullptr;
+
+    if (shouldApplyOcclusionRendering) {
+        // Enable depth writing so virtual objects can be occluded
+        material->setWritesToDepthBuffer(true);
+
+        // Set the depth texture as a secondary texture on the material
+        // The shader modifier will sample this texture via ao_map
+        material->getAmbientOcclusion().setTexture(depthTexture);
+
+        // Add the occlusion shader modifier if not already added
+        if (!_occlusionModifierAdded) {
+            std::shared_ptr<VROShaderModifier> occlusionModifier = VROShaderFactory::createOcclusionDepthModifier();
+            material->addShaderModifier(occlusionModifier);
+            _occlusionModifierAdded = true;
+        }
+    } else {
+        // Disable depth writing when occlusion is off (includes DepthOnly mode)
+        material->setWritesToDepthBuffer(false);
     }
 }
 
@@ -185,10 +237,67 @@ void VROSceneRendererARCore::renderWithTracking(const std::shared_ptr<VROARCamer
     VROVector3f position = camera->getPosition();
 
     /*
+     Set up occlusion depth texture if occlusion is enabled.
+     */
+    VROOcclusionMode occlusionMode = _session->getOcclusionMode();
+    std::shared_ptr<VROTexture> depthTexture = nullptr;
+    VROMatrix4f depthTransform = VROMatrix4f::identity();
+
+    if (occlusionMode != VROOcclusionMode::Disabled && frame->hasDepthData()) {
+        depthTexture = frame->getDepthTexture();
+
+        // Ensure the depth texture is uploaded to GPU before rendering
+        // This is critical - without this, the texture exists but contains no data on GPU
+        if (depthTexture && !depthTexture->isHydrated()) {
+            depthTexture->prewarm(_driver);
+        }
+
+        // Calculate the transform from Screen UV to Depth Texture UV
+        // We use the background texture coordinates which match the camera image orientation
+        VROVector3f BL, BR, TL, TR;
+        ((VROARFrameARCore *)frame.get())->getBackgroundTexcoords(&BL, &BR, &TL, &TR);
+
+        // Construct affine transform:
+        // (0,0) -> TL
+        // (1,0) -> TR
+        // (0,1) -> BL
+        float m[16];
+        m[0] = TR.x - TL.x;  m[4] = BL.x - TL.x;  m[8] = 0;  m[12] = TL.x;
+        m[1] = TR.y - TL.y;  m[5] = BL.y - TL.y;  m[9] = 0;  m[13] = TL.y;
+        m[2] = 0;            m[6] = 0;            m[10]= 1;  m[14] = 0;
+        m[3] = 0;            m[7] = 0;            m[11]= 0;  m[15] = 1;
+
+        depthTransform = VROMatrix4f(m);
+    }
+
+    /*
      Render the 3D scene.
      */
     _pointOfView->getCamera()->setPosition(position);
     _renderer->prepareFrame(_frame, viewport, fov, rotation, projection, _driver);
+
+    // Set occlusion info on the render context
+    _renderer->setOcclusionMode(occlusionMode);
+    _renderer->setDepthTexture(depthTexture);
+    _renderer->setDepthTextureTransform(depthTransform);
+
+    // Expose live camera feed to shader modifiers via 'camera_texture' sampler
+    _renderer->setCameraBackgroundTexture(_session->getCameraBackgroundTexture());
+    _renderer->setCameraImageTransform(frame->getViewportToCameraImageTransform());
+
+    // Expose semantic segmentation texture to shader modifiers via 'semantic_texture' sampler
+    _renderer->setSemanticTexture(_session->getSemanticTexture());
+    // Confidence texture for alpha-blend semantic masking (smooth edges at boundaries).
+    _renderer->setSemanticConfidenceTexture(_session->getSemanticConfidenceTexture());
+    // Semantic texture is in camera image space (GL convention, y=0 bottom) — same transform
+    // as camera background. No additional flip needed on Android.
+    _semanticTextureTransform = frame->getViewportToCameraImageTransform();
+    _renderer->setSemanticTextureTransform(_semanticTextureTransform);
+    _lastViewport = viewport;
+
+    // Update semantic debug overlay on camera background (add/remove modifier as needed).
+    updateBackgroundSemanticsDebug();
+
     _renderer->renderEye(VROEyeType::Monocular, _renderer->getLookAtMatrix(), projection, viewport, _driver);
     _renderer->renderHUD(VROEyeType::Monocular, VROMatrix4f::identity(), projection, _driver);
     _renderer->endFrame(_driver);
@@ -198,6 +307,53 @@ void VROSceneRendererARCore::renderWithTracking(const std::shared_ptr<VROARCamer
      */
     std::shared_ptr<VROARScene> scene = std::dynamic_pointer_cast<VROARScene>(_session->getScene());
     scene->updateAmbientLight(frame->getAmbientLightIntensity(), frame->getAmbientLightColor());
+}
+
+void VROSceneRendererARCore::setSemanticDebugEnabled(bool enabled) {
+    _semanticDebugEnabled = enabled;
+    // Modifier is added/removed on the next frame in updateBackgroundSemanticsDebug.
+}
+
+void VROSceneRendererARCore::setSemanticConfidenceThreshold(float threshold) {
+    _session->setSemanticConfidenceThreshold(threshold);
+}
+
+void VROSceneRendererARCore::updateBackgroundSemanticsDebug() {
+    if (!_cameraBackground) { return; }
+    std::shared_ptr<VROMaterial> material = _cameraBackground->getMaterials()[0];
+
+    if (_semanticDebugEnabled) {
+        if (!_semanticDebugModifierAdded) {
+            _semanticDebugModifier = VROShaderFactory::createSemanticDebugModifier();
+
+            std::weak_ptr<VROSceneRendererARCore> weakSelf = shared_from_this();
+            _semanticDebugModifier->setUniformBinder("ar_viewport_size", VROShaderProperty::Vec3,
+                [weakSelf](VROUniform *uniform, const VROGeometry *geometry, const VROMaterial *material) {
+                    auto strongSelf = weakSelf.lock();
+                    if (strongSelf) {
+                        VROViewport vp = strongSelf->_lastViewport;
+                        uniform->setVec3({(float)vp.getWidth(), (float)vp.getHeight(), 0.0f});
+                    }
+                });
+
+            _semanticDebugModifier->setUniformBinder("ar_semantic_texture_transform", VROShaderProperty::Mat4,
+                [weakSelf](VROUniform *uniform, const VROGeometry *geometry, const VROMaterial *material) {
+                    auto strongSelf = weakSelf.lock();
+                    if (strongSelf) {
+                        uniform->setMat4(strongSelf->_semanticTextureTransform);
+                    }
+                });
+
+            material->addShaderModifier(_semanticDebugModifier);
+            _semanticDebugModifierAdded = true;
+        }
+    } else {
+        if (_semanticDebugModifierAdded && _semanticDebugModifier) {
+            material->removeShaderModifier(_semanticDebugModifier);
+            _semanticDebugModifier.reset();
+            _semanticDebugModifierAdded = false;
+        }
+    }
 }
 
 void VROSceneRendererARCore::renderWaitingForTracking(VROViewport viewport) {
@@ -236,6 +392,15 @@ void VROSceneRendererARCore::initARSession(VROViewport viewport, std::shared_ptr
     material->getDiffuse().setTexture(_session->getCameraBackgroundTexture());
     material->setWritesToDepthBuffer(false);
     material->setNeedsToneMapping(false);
+
+    // If occlusion rendering mode is already set, add the shader modifier now
+    // Note: DepthOnly does NOT apply occlusion rendering, so skip modifier for it
+    VROOcclusionMode occlusionMode = _session->getOcclusionMode();
+    if (occlusionMode == VROOcclusionMode::DepthBased || occlusionMode == VROOcclusionMode::PeopleOnly) {
+        std::shared_ptr<VROShaderModifier> occlusionModifier = VROShaderFactory::createOcclusionDepthModifier();
+        material->addShaderModifier(occlusionModifier);
+        _occlusionModifierAdded = true;
+    }
 
     std::shared_ptr<VROARScene> arScene = std::dynamic_pointer_cast<VROARScene>(scene);
     passert_msg (arScene != nullptr, "AR View requires an AR Scene!");
@@ -297,10 +462,36 @@ void VROSceneRendererARCore::onRotateEvent(int rotateState, float rotateRadians,
     arTouchController->onRotateEvent(rotateState, rotateRadians, viewportX, viewportY);
 }
 
+void VROSceneRendererARCore::onSurfaceDestroyed() {
+    // Called when the EGL context was lost (e.g. Android killed it after 5+ min background).
+    // The old context and all its GL objects (textures, VAOs, FBOs) are gone.
+    // Reset the pieces that guard against double-initialization so that the next renderFrame()
+    // after the new context is created starts fresh:
+    //
+    //  1. _cameraBackground: nulling this causes renderFrame() to call initARSession() again,
+    //     which will allocate a fresh camera OES texture in the new context.
+    //
+    //  2. session camera texture ID: must be reset to 0 so that onResume() doesn't try to
+    //     call ArSession_resume() with the stale OES texture name (which no longer exists in
+    //     the new context), and so that initCameraTexture() allocates a new GL texture rather
+    //     than reusing the dead one.
+    //
+    // We do NOT call deleteGL() or any GL API here — the old context is already gone and the
+    // new context is now active; calling gl*Delete on old IDs would be a no-op at best and
+    // could corrupt the new context's namespace at worst.
+    pinfo("VROSceneRendererARCore: EGL context lost — resetting AR session GL state");
+    _cameraBackground.reset();
+    if (_session) {
+        _session->invalidateCameraTexture();
+    }
+    // Also clear the occlusionModifierAdded flag so it gets re-evaluated with the new background.
+    _occlusionModifierAdded = false;
+}
+
 void VROSceneRendererARCore::onPause() {
     _session->pause();
-
     std::shared_ptr<VROSceneRendererARCore> shared = shared_from_this();
+
     VROPlatformDispatchAsyncRenderer([shared] {
         shared->_renderer->getInputController()->onPause();
         shared->_driver->pause();
@@ -308,7 +499,21 @@ void VROSceneRendererARCore::onPause() {
 }
 
 void VROSceneRendererARCore::onResume() {
-    _session->run();
+    // Only resume the AR session here if the camera OES texture has already been
+    // initialized (i.e. getCameraTextureId() != 0).  run() will re-register the
+    // texture with ARCore before calling ArSession_resume(), satisfying the ARCore
+    // requirement after every pause/resume cycle.
+    //
+    // If the texture hasn't been created yet (e.g. AR→AR transition where a new
+    // VROSceneRendererARCore was just constructed), we must NOT resume here.
+    // ArSession_resume() would open the camera hardware with no OES texture registered,
+    // causing a Mali EGL image allocation failure and a permanently frozen camera feed.
+    // In that case initARSession() (called from the first renderFrame()) will call
+    // initCameraTexture() followed by run() in the correct order.
+    if (_session->getCameraTextureId() != 0) {
+        _session->run();
+    }
+
     std::shared_ptr<VROSceneRendererARCore> shared = shared_from_this();
 
     VROPlatformDispatchAsyncRenderer([shared] {
@@ -318,7 +523,38 @@ void VROSceneRendererARCore::onResume() {
 }
 
 void VROSceneRendererARCore::onDestroy() {
+    if (_destroyed) {
+        return;
+    }
     _destroyed = true;
+
+    // Pause the AR session
+    if (_session) {
+        _session->pause();
+    }
+
+    // Reset camera background surface to release texture
+    _cameraBackground.reset();
+
+    // Clean up scene controller and its resources
+    if (_sceneController) {
+        if (_sceneController->getScene()) {
+            _sceneController->getScene()->getRootNode()->deleteGL();
+        }
+        _sceneController.reset();
+    }
+
+    // Reset point of view
+    _pointOfView.reset();
+
+    // Reset renderer (releases GPU resources, frame synchronizer, etc.)
+    _renderer.reset();
+
+    // Reset AR session (triggers its destructor which cleans up ARCore)
+    _session.reset();
+
+    // Reset driver LAST as other objects depend on it
+    _driver.reset();
 }
 
 void VROSceneRendererARCore::setVRModeEnabled(bool enabled) {

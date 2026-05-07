@@ -43,6 +43,7 @@
 #include "VROModelIOUtil.h"
 #include "VROBone.h"
 #include "VROKeyframeAnimation.h"
+#include "VROTimingFunction.h"
 #include "VROSkeletalAnimation.h"
 #include "VROSkeleton.h"
 #include "VROBoneUBO.h"
@@ -51,6 +52,8 @@
 #include "VROShaderModifier.h"
 #include "VROShaderProgram.h"
 #include "VROMorpher.h"
+#include "VRONodeCamera.h"
+#include "VROLight.h"
 
 static std::string kVROGLTFInputSamplerKey = "timeInput";
 std::map<std::string, std::shared_ptr<VROVertexBuffer>> VROGLTFLoader::_dataCache;
@@ -70,6 +73,20 @@ std::map<int, std::map<int,std::vector<int>>> VROGLTFLoader::_skinIndexToJointCh
 
 // An map of all root skeleton joint indexes.
 std::map<int, int> VROGLTFLoader::_skinIndexToSkeletonRootJoint;
+
+// Per-mesh bone attribute sources, populated during processMesh and consumed in processNode.
+std::map<int, std::shared_ptr<VROGeometrySource>> VROGLTFLoader::_meshBoneIndices;
+std::map<int, std::shared_ptr<VROGeometrySource>> VROGLTFLoader::_meshBoneWeights;
+
+// Node parent map: nodeIndex → parentNodeIndex (built in processSkinner).
+std::map<int, int> VROGLTFLoader::_nodeParentMap;
+std::map<int, std::set<int>> VROGLTFLoader::_skinMeshAncestors;
+
+// Bind-pose data for animated nodes — populated in processNode, used by injectBindPoseAnimations.
+std::map<int, std::shared_ptr<VRONode>> VROGLTFLoader::_nodeGLTFMap;
+std::map<int, VROVector3f>   VROGLTFLoader::_nodeBindPos;
+std::map<int, VROVector3f>   VROGLTFLoader::_nodeBindScale;
+std::map<int, VROQuaternion> VROGLTFLoader::_nodeBindRot;
 
 static int getTypeSize(GLTFType type) {
     switch (type) {
@@ -112,7 +129,19 @@ VROGeometrySourceSemantic VROGLTFLoader::getGeometryAttribute(std::string name) 
     } else if (VROStringUtil::strcmpinsensitive(name, "WEIGHTS_0")) {
         return VROGeometrySourceSemantic::BoneWeights;
     } else {
-        pwarn("Attempted to parse an unknown geometry attribute: %s", name.c_str());
+        // Silently ignore additional UV sets (TEXCOORD_1..N), extra color layers,
+        // and other unsupported semantics — they are valid glTF but not needed.
+        bool isExtraTexcoord = (name.size() >= 9 && name.substr(0, 9) == "TEXCOORD_" &&
+                                name != "TEXCOORD_0");
+        bool isExtraJoints  = (name.size() >= 7 && name.substr(0, 7) == "JOINTS_"  &&
+                                name != "JOINTS_0");
+        bool isExtraWeights = (name.size() >= 8 && name.substr(0, 8) == "WEIGHTS_" &&
+                                name != "WEIGHTS_0");
+        bool isExtraColor   = (name.size() >= 6 && name.substr(0, 6) == "COLOR_"   &&
+                                name != "COLOR_0");
+        if (!isExtraTexcoord && !isExtraJoints && !isExtraWeights && !isExtraColor) {
+            pwarn("Attempted to parse an unknown geometry attribute: %s", name.c_str());
+        }
     }
     return VROGeometrySourceSemantic::Invalid;
 }
@@ -189,13 +218,13 @@ bool VROGLTFLoader::getPrimitiveType(int mode, VROGeometryPrimitiveType &type) {
             type = VROGeometryPrimitiveType::TriangleStrip;
             break;
         case TINYGLTF_MODE_LINE_LOOP:
-            // TODO VIRO-3686: Add support for additional primitive modes.
-            perr("GLTF Mode LINE_LOOP primitive is not yet supported!");
-            return false;
+            // LINE_LOOP will be converted to Line in processVertexElement
+            type = VROGeometryPrimitiveType::Line;
+            break;
         case TINYGLTF_MODE_TRIANGLE_FAN:
-            // TODO VIRO-3686: Add support for additional primitive modes.
-            perr("GLTF Mode TRIANGLE_FAN primitive is not yet supported!");
-            return false;
+            // TRIANGLE_FAN will be converted to Triangle in processVertexElement
+            type = VROGeometryPrimitiveType::Triangle;
+            break;
         default:
             perr("Unsupported GLTF primitive type provided for this model.");
             return false;
@@ -206,26 +235,39 @@ bool VROGLTFLoader::getPrimitiveType(int mode, VROGeometryPrimitiveType &type) {
 VROFilterMode VROGLTFLoader::getFilterMode(int mode) {
     switch(mode) {
         case TINYGLTF_TEXTURE_FILTER_NEAREST:
-            //choose 1 pixel from the biggest mip
             return VROFilterMode::Nearest;
         case TINYGLTF_TEXTURE_FILTER_LINEAR:
-            //choose 4 pixels from the biggest mip and blend them
-            return VROFilterMode ::Linear;
+            return VROFilterMode::Linear;
         case TINYGLTF_TEXTURE_FILTER_NEAREST_MIPMAP_NEAREST:
-            // Behavior: Choose the best mip, then pick one pixel from that mip
-            // TODO VIRO-3687: Add additional Sampler filter modes. Fallback to nearest for now.
+            // Minification filter: Nearest (pick 1 pixel from chosen mip)
             return VROFilterMode::Nearest;
         case TINYGLTF_TEXTURE_FILTER_LINEAR_MIPMAP_NEAREST:
-            // Behavior: choose the best mip, then blend 4 pixels from that mip
-            // TODO VIRO-3687: Add additional Sampler filter modes. Fallback to nearest for now.
+            // Minification filter: Linear (blend 4 pixels from chosen mip)
+            return VROFilterMode::Linear;
+        case TINYGLTF_TEXTURE_FILTER_NEAREST_MIPMAP_LINEAR:
+            // Minification filter: Nearest (pick 1 pixel from each mip, then blend)
+            return VROFilterMode::Nearest;
+        case TINYGLTF_TEXTURE_FILTER_LINEAR_MIPMAP_LINEAR:
+            // Minification filter: Linear (trilinear filtering)
+            return VROFilterMode::Linear;
+        default:
+            return VROFilterMode::Linear;
+    }
+}
+
+VROFilterMode VROGLTFLoader::getMipFilterMode(int mode) {
+    switch(mode) {
+        case TINYGLTF_TEXTURE_FILTER_NEAREST:
+        case TINYGLTF_TEXTURE_FILTER_LINEAR:
+            // No mipmap filtering for non-mipmap modes
+            return VROFilterMode::None;
+        case TINYGLTF_TEXTURE_FILTER_NEAREST_MIPMAP_NEAREST:
+        case TINYGLTF_TEXTURE_FILTER_LINEAR_MIPMAP_NEAREST:
+            // Mip filter: Nearest (choose closest mip level)
             return VROFilterMode::Nearest;
         case TINYGLTF_TEXTURE_FILTER_NEAREST_MIPMAP_LINEAR:
-            // Behavior: choose the best 2 mips, choose 1 pixel from each, blend them
-            // TODO VIRO-3687: Add additional Sampler filter modes. Fallback to Linear for now.
-            return VROFilterMode::Linear;
         case TINYGLTF_TEXTURE_FILTER_LINEAR_MIPMAP_LINEAR:
-            // Behavior: choose the best 2 mips. choose 4 pixels from each, blend them
-            // TODO VIRO-3687: Add additional Sampler filter modes. Fallback to Linear for now.
+            // Mip filter: Linear (blend between two closest mip levels)
             return VROFilterMode::Linear;
         default:
             return VROFilterMode::Linear;
@@ -243,6 +285,105 @@ VROWrapMode VROGLTFLoader::getWrappingMode(int mode) {
         default:
             return VROWrapMode::Repeat;
     }
+}
+
+bool VROGLTFLoader::applySparseAccessorData(const tinygltf::Model &gModel,
+                                            const tinygltf::Accessor &accessor,
+                                            std::vector<unsigned char> &outputData) {
+    if (!accessor.sparse.isSparse) {
+        return true;  // No sparse data to apply
+    }
+
+    const tinygltf::Sparse &sparse = accessor.sparse;
+
+    // Calculate the size of each element in the accessor
+    int componentSize = 0;
+    switch (accessor.componentType) {
+        case TINYGLTF_COMPONENT_TYPE_BYTE:
+        case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:
+            componentSize = 1;
+            break;
+        case TINYGLTF_COMPONENT_TYPE_SHORT:
+        case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT:
+            componentSize = 2;
+            break;
+        case TINYGLTF_COMPONENT_TYPE_INT:
+        case TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT:
+        case TINYGLTF_COMPONENT_TYPE_FLOAT:
+            componentSize = 4;
+            break;
+        case TINYGLTF_COMPONENT_TYPE_DOUBLE:
+            componentSize = 8;
+            break;
+        default:
+            perr("Unknown component type in sparse accessor");
+            return false;
+    }
+
+    int numComponents = 0;
+    switch (accessor.type) {
+        case TINYGLTF_TYPE_SCALAR: numComponents = 1; break;
+        case TINYGLTF_TYPE_VEC2: numComponents = 2; break;
+        case TINYGLTF_TYPE_VEC3: numComponents = 3; break;
+        case TINYGLTF_TYPE_VEC4: numComponents = 4; break;
+        case TINYGLTF_TYPE_MAT2: numComponents = 4; break;
+        case TINYGLTF_TYPE_MAT3: numComponents = 9; break;
+        case TINYGLTF_TYPE_MAT4: numComponents = 16; break;
+        default:
+            perr("Unknown accessor type in sparse accessor");
+            return false;
+    }
+
+    size_t elementSize = componentSize * numComponents;
+
+    // Read sparse indices
+    const tinygltf::BufferView &indicesBufferView = gModel.bufferViews[sparse.indices.bufferView];
+    const tinygltf::Buffer &indicesBuffer = gModel.buffers[indicesBufferView.buffer];
+    const unsigned char *indicesData = indicesBuffer.data.data() + indicesBufferView.byteOffset + sparse.indices.byteOffset;
+
+    // Read sparse values
+    const tinygltf::BufferView &valuesBufferView = gModel.bufferViews[sparse.values.bufferView];
+    const tinygltf::Buffer &valuesBuffer = gModel.buffers[valuesBufferView.buffer];
+    const unsigned char *valuesData = valuesBuffer.data.data() + valuesBufferView.byteOffset + sparse.values.byteOffset;
+
+    // Apply sparse values at specified indices
+    for (size_t i = 0; i < sparse.count; i++) {
+        // Read the index based on component type
+        size_t index = 0;
+        switch (sparse.indices.componentType) {
+            case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:
+                index = indicesData[i];
+                break;
+            case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT:
+                index = reinterpret_cast<const uint16_t *>(indicesData)[i];
+                break;
+            case TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT:
+                index = reinterpret_cast<const uint32_t *>(indicesData)[i];
+                break;
+            default:
+                perr("Invalid sparse indices component type");
+                return false;
+        }
+
+        // Verify index is within bounds
+        if (index >= accessor.count) {
+            perr("Sparse accessor index out of bounds: %zu >= %zu", index, accessor.count);
+            return false;
+        }
+
+        // Copy the sparse value to the output data at the specified index
+        size_t destOffset = index * elementSize;
+        size_t srcOffset = i * elementSize;
+
+        if (destOffset + elementSize > outputData.size()) {
+            perr("Sparse accessor destination out of bounds");
+            return false;
+        }
+
+        memcpy(outputData.data() + destOffset, valuesData + srcOffset, elementSize);
+    }
+
+    return true;
 }
 
 void VROGLTFLoader::loadGLTFFromResource(std::string gltfManifestFilePath, const std::map<std::string, std::string> overwriteResourceMap,
@@ -313,10 +454,24 @@ void VROGLTFLoader::loadGLTFFromResource(std::string gltfManifestFilePath, const
                         // those nodes along the way.
                         bool success = true;
                         std::shared_ptr<VRONode> gltfRootNode = std::make_shared<VRONode>();
-                        for (const tinygltf::Scene &gScene : model.scenes) {
+
+                        // Per glTF 2.0 spec: if defaultScene is specified, load only that scene.
+                        // Otherwise, load all scenes in the file.
+                        if (model.defaultScene >= 0 && model.defaultScene < model.scenes.size()) {
+                            // Load only the default scene
+                            const tinygltf::Scene &gScene = model.scenes[model.defaultScene];
                             if (!processScene(model, gltfRootNode, gScene, driver)) {
                                 success = false;
-                                break;
+                            }
+                            pinfo("Loaded default scene '%s' (index %d)", gScene.name.c_str(), model.defaultScene);
+                        } else {
+                            // No default scene specified, load all scenes
+                            for (size_t i = 0; i < model.scenes.size(); i++) {
+                                const tinygltf::Scene &gScene = model.scenes[i];
+                                if (!processScene(model, gltfRootNode, gScene, driver)) {
+                                    success = false;
+                                    break;
+                                }
                             }
                         }
 
@@ -324,6 +479,12 @@ void VROGLTFLoader::loadGLTFFromResource(std::string gltfManifestFilePath, const
                             std::shared_ptr<VROSkinner> skin = _skinMap[skeletonPair.first];
                             skeletonPair.second->setSkinnerRootNode(skin->getSkinnerNode());
                         }
+
+                        // Inject bind-pose reset animations for any (node, animationName) pair
+                        // where the node has some animations but not this one. Without this,
+                        // switching animations leaves non-driven joint nodes at their previous
+                        // animation's final pose, causing visible mesh disassembly.
+                        injectBindPoseAnimations();
 
                         // Once we have processed the model, injected it into the scene.
                         injectGLTF(success ? gltfRootNode : nullptr, rootNode, driver, onFinish);
@@ -350,11 +511,108 @@ void VROGLTFLoader::clearCachedData() {
     _nodeKeyFrameAnims.clear();
     _skinSkeletalAnims.clear();
     _skinIndexToSkeletonRootJoint.clear();
+    _meshBoneIndices.clear();
+    _meshBoneWeights.clear();
+    _nodeParentMap.clear();
+    _skinMeshAncestors.clear();
+    _nodeGLTFMap.clear();
+    _nodeBindPos.clear();
+    _nodeBindScale.clear();
+    _nodeBindRot.clear();
+}
+
+void VROGLTFLoader::injectBindPoseAnimations() {
+    // Collect all unique animation names present anywhere in the model.
+    std::set<std::string> allAnimNames;
+    for (auto &nodePair : _nodeKeyFrameAnims) {
+        for (auto &animPair : nodePair.second) {
+            for (auto &anim : animPair.second) {
+                allAnimNames.insert(anim->getName());
+            }
+        }
+    }
+    if (allAnimNames.empty()) {
+        return;
+    }
+
+    // For each node that participates in at least one animation, inject a single-frame
+    // bind-pose animation for every animation name it's missing.
+    // When animation B starts, VRONode::getAnimation("B", true) collects B animations from
+    // all descendants. Nodes that have no "B" animation contribute nothing and retain their
+    // final pose from the previous animation — causing visible mesh disassembly (e.g. the
+    // head "floating" upward). These injected animations snap those nodes to their GLTF
+    // default TRS at the start of B, matching how Three.js / Babylon.js handle clip switching.
+    for (auto &nodePair : _nodeGLTFMap) {
+        int nodeIndex = nodePair.first;
+        std::shared_ptr<VRONode> node = nodePair.second;
+
+        // Collect animation names this node already has.
+        std::set<std::string> nodeAnimNames;
+        auto it = _nodeKeyFrameAnims.find(nodeIndex);
+        if (it != _nodeKeyFrameAnims.end()) {
+            for (auto &animPair : it->second) {
+                for (auto &anim : animPair.second) {
+                    nodeAnimNames.insert(anim->getName());
+                }
+            }
+        }
+
+        VROVector3f bindPos   = _nodeBindPos[nodeIndex];
+        VROVector3f bindScale = _nodeBindScale[nodeIndex];
+        VROQuaternion bindRot = _nodeBindRot[nodeIndex];
+
+        for (const std::string &animName : allAnimNames) {
+            if (nodeAnimNames.count(animName)) {
+                continue;
+            }
+            // Single keyframe at t=0 with the node's default GLTF TRS.
+            // VROMathInterpolateKeyFrameVector3f returns outputs.front() when input < inputs.front(),
+            // and outputs.back() when input >= inputs.back(). With one keyframe at t=0, any
+            // normalized t in [0,1] satisfies t >= 0 → always returns bindPose. Duration of 0.001s
+            // makes it finish almost instantly without blocking the compound animation's length.
+            std::vector<std::unique_ptr<VROKeyframeAnimationFrame>> frames;
+            std::unique_ptr<VROKeyframeAnimationFrame> frame(new VROKeyframeAnimationFrame());
+            frame->time        = 0.0f;
+            frame->translation = bindPos;
+            frame->scale       = bindScale;
+            frame->rotation    = bindRot;
+            frames.push_back(std::move(frame));
+
+            auto bindAnim = std::make_shared<VROKeyframeAnimation>(
+                frames, 0.001f, true, true, true, false);
+            bindAnim->setName(animName);
+            node->addAnimation(animName, bindAnim);
+        }
+    }
 }
 
 bool VROGLTFLoader::processSkinner(const tinygltf::Model &model) {
     if (model.skins.size() == 0) {
         return true;
+    }
+
+    // Build a parent-node lookup used later to walk up non-skin ancestor chains
+    // when computing world transforms for skins whose root joint is not at the scene root.
+    _nodeParentMap.clear();
+    for (int ni = 0; ni < (int)model.nodes.size(); ni++) {
+        for (int childIdx : model.nodes[ni].children) {
+            _nodeParentMap[childIdx] = ni;
+        }
+    }
+
+    // Build _skinMeshAncestors: for each skin, record the ancestor node indices of the mesh
+    // node that references that skin (gNode.skin == skinIndex). These ancestors are already
+    // applied by Viro's renderer as the mesh node's modelMatrix and must NOT be included in
+    // the non-skin ancestor walk in processSkeletalTransformsForFrame.
+    _skinMeshAncestors.clear();
+    for (int ni = 0; ni < (int)model.nodes.size(); ni++) {
+        int skinIdx = model.nodes[ni].skin;
+        if (skinIdx < 0) continue;
+        int cur = ni;
+        while (_nodeParentMap.count(cur)) {
+            cur = _nodeParentMap[cur];
+            _skinMeshAncestors[skinIdx].insert(cur);
+        }
     }
 
     // Create a map of all known joints used for building a tree of the
@@ -429,15 +687,23 @@ bool VROGLTFLoader::processSkinner(const tinygltf::Model &model) {
             if (jointIndex == rootJoint) {
                 parentJointIndex = -1;
             }
-            
-            // TODO We need the bone local transform if we want layered animations to work with GLTF
+
+            // Extract the bone's local transform from the corresponding glTF node so that
+            // non-animated joints hold their rest-pose and layered skeletal animations work.
+            int jointNodeIndex = _skinIndexToJointNodeIndex[skinIndex][jointIndex];
+            VROMatrix4f localTransform = getTransformOfNode(model, jointNodeIndex);
             VROMatrix4f boneSpaceBindTransform = invBindTransformsOut[jointIndex];
-            std::string name = "BoneIndex_" + VROStringUtil::toString(jointIndex);
+
+            // Use the glTF node name when available; fall back to index-based name.
+            std::string nodeName = model.nodes[jointNodeIndex].name;
+            std::string name = nodeName.empty()
+                ? "BoneIndex_" + VROStringUtil::toString(jointIndex)
+                : nodeName;
 
             std::shared_ptr<VROBone> bone = std::make_shared<VROBone>(jointIndex,
                                                                       parentJointIndex,
                                                                       name,
-                                                                      VROMatrix4f::identity(),
+                                                                      localTransform,
                                                                       boneSpaceBindTransform);
             bones.push_back(bone);
         }
@@ -496,13 +762,13 @@ bool VROGLTFLoader::processAnimations(const tinygltf::Model &model) {
         }
     }
 
-    // For each animation, determine if it is a skeletalAnimation (gLTF doesn't tell us)
-    // To do this, we assume that if an animation contains ANY of the nodes specified in a
-    // skinner, it is treated automatically as a skeletalAnim.
-    std::map<int, std::pair<int, std::vector<int>>> skeletalAnimToSkinToNodeMap;
-    for (int animIndex = 0; animIndex < animToNodeIndexMap.size(); animIndex++) {
-        for (int skinIndex = 0; skinIndex < skinToNodeMap.size(); skinIndex ++) {
-            // Check to which joints are skeletal animations
+    // For each animation, determine if it is a skeletalAnimation (gLTF doesn't tell us).
+    // An animation is skeletal if it targets ANY node that belongs to a skin.
+    // A single glTF animation may drive multiple skins (e.g. a character body + visor),
+    // so we accumulate ALL matching skins rather than keeping only the last one.
+    std::map<int, std::vector<std::pair<int, std::vector<int>>>> skeletalAnimToSkinToNodeMap;
+    for (int animIndex = 0; animIndex < (int)animToNodeIndexMap.size(); animIndex++) {
+        for (int skinIndex = 0; skinIndex < (int)skinToNodeMap.size(); skinIndex++) {
             std::vector<int> animatedSkeletalJoint;
             for (auto i : skinToNodeMap[skinIndex]) {
                 for (auto x : animToNodeIndexMap[animIndex]) {
@@ -511,9 +777,9 @@ bool VROGLTFLoader::processAnimations(const tinygltf::Model &model) {
                     }
                 }
             }
-
             if (animatedSkeletalJoint.size() > 0) {
-                skeletalAnimToSkinToNodeMap[animIndex] = std::make_pair(skinIndex, animatedSkeletalJoint);
+                skeletalAnimToSkinToNodeMap[animIndex].push_back(
+                    std::make_pair(skinIndex, animatedSkeletalJoint));
             }
         }
     }
@@ -603,7 +869,8 @@ std::shared_ptr<VROKeyframeAnimation> VROGLTFLoader::convertChannelToKeyFrameAni
     bool hasMorphWeights = false;
     tinygltf::AnimationChannel channel = anim.channels[targetedChannel];
     tinygltf::AnimationSampler gSampler = anim.samplers[channel.sampler];
-    if (!processRawChannelData(gModel, channel.target_path, channel.target_node, gSampler, frames)) {
+    // Pass duration so processRawChannelData can scale CUBICSPLINE tangents correctly.
+    if (!processRawChannelData(gModel, channel.target_path, channel.target_node, gSampler, frames, duration)) {
         perr("Failed to process channel index %s for gltf model!", channel.target_path.c_str());
         return nullptr;
     }
@@ -618,17 +885,30 @@ std::shared_ptr<VROKeyframeAnimation> VROGLTFLoader::convertChannelToKeyFrameAni
         hasMorphWeights = true;
     }
 
-    return std::make_shared<VROKeyframeAnimation>(frames, duration, hasTranslation, hasRotation, hasScale, hasMorphWeights);
+    // Determine the interpolation timing function type from the glTF sampler.
+    // CUBICSPLINE is pre-baked into dense linear keyframes in processRawChannelData,
+    // so it is handled as Linear here.
+    VROTimingFunctionType timingType = VROTimingFunctionType::Linear;
+    if (VROStringUtil::strcmpinsensitive(gSampler.interpolation, "step")) {
+        timingType = VROTimingFunctionType::Step;
+    }
+
+    return std::make_shared<VROKeyframeAnimation>(frames, duration, hasTranslation, hasRotation, hasScale, hasMorphWeights, timingType);
 }
 
 bool VROGLTFLoader::processRawChannelData(const tinygltf::Model &gModel,
                                           std::string channelProperty,
                                           int channelTarget,
                                           const tinygltf::AnimationSampler &channelSampler,
-                                          std::vector<std::unique_ptr<VROKeyframeAnimationFrame>> &framesOut) {
-    // TODO VIRO-3848: Support additional 3D Model Interpolation types
-    if (!VROStringUtil::strcmpinsensitive(channelSampler.interpolation, "linear")) {
-        pwarn("Viro does not currently support non-linear animations for gltf models.");
+                                          std::vector<std::unique_ptr<VROKeyframeAnimationFrame>> &framesOut,
+                                          float animDuration) {
+    // Support LINEAR, STEP, and CUBICSPLINE interpolation types.
+    // CUBICSPLINE output is pre-baked into dense linear keyframes via Hermite interpolation.
+    bool isCubicSpline = VROStringUtil::strcmpinsensitive(channelSampler.interpolation, "cubicspline");
+    if (!VROStringUtil::strcmpinsensitive(channelSampler.interpolation, "linear") &&
+        !VROStringUtil::strcmpinsensitive(channelSampler.interpolation, "step") &&
+        !isCubicSpline) {
+        pwarn("Unknown animation interpolation type: %s", channelSampler.interpolation.c_str());
         return false;
     }
 
@@ -682,24 +962,45 @@ bool VROGLTFLoader::processRawChannelData(const tinygltf::Model &gModel,
             framesOut.push_back(std::move(frame));
         }
     } else if (VROStringUtil::strcmpinsensitive(channelProperty, "weights")) {
-        if ((elementCount != (framesOut.size() * numberOfMorphTargets))) {
+        // For CUBICSPLINE each keyframe has 3 × M scalars: [M in-tangents][M values][M out-tangents]
+        size_t expectedCount = isCubicSpline
+            ? framesOut.size() * numberOfMorphTargets * 3
+            : framesOut.size() * numberOfMorphTargets;
+        if (elementCount != expectedCount) {
             perr("Animation frame %s do not match number of morph keyframes %d, %d",
-                 channelProperty.c_str(), (int) elementCount, (int) (framesOut.size() * numberOfMorphTargets));
+                 channelProperty.c_str(), (int) elementCount, (int) expectedCount);
             return false;
         }
-    } else if (elementCount != framesOut.size()) {
-        // Else if we are processing an output channel (animation data relating to key frames),
-        // ensure that the size of the data aligns with the number of expected key frames.
-        perr("Animation frame %s do not match number of keyframes %d, %d", channelProperty.c_str(), (int) elementCount, (int) framesOut.size());
-        return false;
+    } else {
+        // For CUBICSPLINE each keyframe has 3 elements: [in-tangent, value, out-tangent]
+        size_t expectedCount = isCubicSpline ? framesOut.size() * 3 : framesOut.size();
+        if (elementCount != expectedCount) {
+            perr("Animation frame %s do not match number of keyframes %d, %d",
+                 channelProperty.c_str(), (int) elementCount, (int) framesOut.size());
+            return false;
+        }
     }
+
+    // Channel type flags for CUBICSPLINE tangent handling
+    bool isTranslationCh = VROStringUtil::strcmpinsensitive(channelProperty, "translation");
+    bool isScaleCh       = VROStringUtil::strcmpinsensitive(channelProperty, "scale");
+    bool isRotationCh    = VROStringUtil::strcmpinsensitive(channelProperty, "rotation");
+    bool isWeightsCh     = VROStringUtil::strcmpinsensitive(channelProperty, "weights");
+
+    // Tangent storage for CUBICSPLINE Hermite baking (translation/scale share vec3 tangents;
+    // rotation uses quaternion tangents). Sized to the current keyframe count.
+    std::vector<VROVector3f>   inTangentsVec3(framesOut.size());
+    std::vector<VROVector3f>  outTangentsVec3(framesOut.size());
+    std::vector<VROQuaternion>  inTangentsQuat(framesOut.size());
+    std::vector<VROQuaternion> outTangentsQuat(framesOut.size());
+    bool hasTangents = false;
 
     // Now process that buffer to produce the right output data.
     const tinygltf::Buffer &gBuffer = gModel.buffers[gIndiceBufferView.buffer];
     std::vector<float> tempVec;
     int morphIndex = 0;
     VROByteBuffer buffer((char *)gBuffer.data.data() + dataOffset, dataLength, false);
-    for (int elementIndex = 0; elementIndex < elementCount; elementIndex++) {
+    for (int elementIndex = 0; elementIndex < (int)elementCount; elementIndex++) {
 
         // Set the buffer position to begin at each element index - Ex: Each Vec4.
         buffer.setPosition(elementIndex * bufferViewStride);
@@ -733,136 +1034,260 @@ bool VROGLTFLoader::processRawChannelData(const tinygltf::Model &gModel,
             }
         }
 
-        if (VROStringUtil::strcmpinsensitive(channelProperty, "translation") && tempVec.size() == 3) {
-            framesOut[elementIndex]->translation = {tempVec[0], tempVec[1], tempVec[2]};
-        } else if (VROStringUtil::strcmpinsensitive(channelProperty, "rotation")&& tempVec.size() == 4) {
-            framesOut[elementIndex]->rotation = {tempVec[0], tempVec[1], tempVec[2], tempVec[3]};
-        } else if (VROStringUtil::strcmpinsensitive(channelProperty, "scale")&& tempVec.size() == 3) {
-            framesOut[elementIndex]->scale = {tempVec[0], tempVec[1], tempVec[2]};
+        // For CUBICSPLINE output channels, each keyframe has three consecutive elements:
+        //   [in-tangent, value, out-tangent] for translation/scale/rotation
+        //   or per keyframe: [M in-tangents][M values][M out-tangents] for weights.
+        // Compute the true frame index and triplet position (0=in, 1=value, 2=out).
+        int frameIndex = elementIndex;
+        int tripletPos = 1;  // default: value element (LINEAR / STEP)
+        int weightMorphIdx = morphIndex;
+        if (isCubicSpline && !VROStringUtil::strcmpinsensitive(channelProperty, kVROGLTFInputSamplerKey)) {
+            if (isWeightsCh) {
+                int totalPerFrame = numberOfMorphTargets * 3;
+                int posInFrame    = elementIndex % totalPerFrame;
+                frameIndex        = elementIndex / totalPerFrame;
+                tripletPos        = posInFrame / numberOfMorphTargets;  // 0=in, 1=val, 2=out
+                weightMorphIdx    = posInFrame % numberOfMorphTargets;
+            } else {
+                tripletPos  = elementIndex % 3;   // 0=in, 1=value, 2=out
+                frameIndex  = elementIndex / 3;
+            }
+        } else if (isWeightsCh && numberOfMorphTargets > 0) {
+            // LINEAR/STEP weights: data is packed [frame0_m0, frame0_m1, ..., frame1_m0, ...]
+            // elementIndex spans N_frames * N_targets, so divide to get the true frame index.
+            frameIndex     = elementIndex / numberOfMorphTargets;
+            weightMorphIdx = morphIndex;  // already tracked by the morphIndex counter below
+        }
+
+        if (isTranslationCh && tempVec.size() == 3) {
+            if (tripletPos == 1) {
+                framesOut[frameIndex]->translation = {tempVec[0], tempVec[1], tempVec[2]};
+            } else if (isCubicSpline) {
+                VROVector3f tangent(tempVec[0], tempVec[1], tempVec[2]);
+                if (tripletPos == 0) inTangentsVec3[frameIndex]  = tangent;
+                else                 outTangentsVec3[frameIndex] = tangent;
+                hasTangents = true;
+            }
+        } else if (isRotationCh && tempVec.size() == 4) {
+            if (tripletPos == 1) {
+                framesOut[frameIndex]->rotation = {tempVec[0], tempVec[1], tempVec[2], tempVec[3]};
+            } else if (isCubicSpline) {
+                VROQuaternion tangent(tempVec[0], tempVec[1], tempVec[2], tempVec[3]);
+                if (tripletPos == 0) inTangentsQuat[frameIndex]  = tangent;
+                else                 outTangentsQuat[frameIndex] = tangent;
+                hasTangents = true;
+            }
+        } else if (isScaleCh && tempVec.size() == 3) {
+            if (tripletPos == 1) {
+                framesOut[frameIndex]->scale = {tempVec[0], tempVec[1], tempVec[2]};
+            } else if (isCubicSpline) {
+                VROVector3f tangent(tempVec[0], tempVec[1], tempVec[2]);
+                if (tripletPos == 0) inTangentsVec3[frameIndex]  = tangent;
+                else                 outTangentsVec3[frameIndex] = tangent;
+                hasTangents = true;
+            }
         } else if (VROStringUtil::strcmpinsensitive(channelProperty, kVROGLTFInputSamplerKey)) {
             framesOut[elementIndex]->time = tempVec[0];
-        } else if (VROStringUtil::strcmpinsensitive(channelProperty, "weights")) {
-            // GLTF only supports animating one primitive's morph target on a node at a time
-            // and as such we process only a single morph target per channel.
-            int meshIndex = gModel.nodes[channelTarget].mesh;
-            std::string key = getMorphTargetName(gModel,
-                                                 gModel.meshes[meshIndex].primitives.front(),
-                                                 morphIndex);
-            framesOut[elementIndex/numberOfMorphTargets]->morphWeights[key] = tempVec[0];
-
-            // The weights for all morph targets are tightly interleaved. As such, use
-            // morphIndex to increment, track and accumulate all morph data for this frame.
-            // Once we have hit the numberOfMorphTargets, we reset this to 0 to move
-            // onto the next frame containing the new set of morph data.
-            morphIndex ++;
-            if (morphIndex >= numberOfMorphTargets) {
-                morphIndex = 0;
+        } else if (isWeightsCh) {
+            // For CUBICSPLINE weights, only write the value elements (tripletPos == 1).
+            // Tangent baking for morph weights is not yet implemented.
+            if (tripletPos == 1) {
+                int meshIndex = gModel.nodes[channelTarget].mesh;
+                std::string key = getMorphTargetName(gModel,
+                                                     gModel.meshes[meshIndex],
+                                                     gModel.meshes[meshIndex].primitives.front(),
+                                                     weightMorphIdx);
+                framesOut[frameIndex]->morphWeights[key] = tempVec[0];
+            }
+            // For LINEAR/STEP, advance morphIndex as before.
+            if (!isCubicSpline) {
+                morphIndex++;
+                if (morphIndex >= numberOfMorphTargets) {
+                    morphIndex = 0;
+                }
             }
         } else {
             pwarn("Invalid target path %s with data size %d provided for gLTF.", channelProperty.c_str(), (int) tempVec.size());
             return false;
         }
     }
+
+    // Hermite resampling for CUBICSPLINE translation / scale / rotation channels.
+    // Pre-bakes the cubic spline into dense linear keyframes so the existing linear
+    // animation system produces smooth curves without modification.
+    if (isCubicSpline && hasTangents && (int)framesOut.size() >= 2) {
+        const int SUBSTEPS = 8;  // sub-steps per original keyframe segment
+        std::vector<std::unique_ptr<VROKeyframeAnimationFrame>> resampled;
+        resampled.reserve((framesOut.size() - 1) * SUBSTEPS + 1);
+
+        for (int k = 0; k < (int)framesOut.size() - 1; k++) {
+            float tau0   = framesOut[k]->time;
+            float tau1   = framesOut[k + 1]->time;
+            float dtNorm = tau1 - tau0;
+            // glTF tangents are in value/second; convert to value/normalized-time.
+            float tangentScale = dtNorm * animDuration;
+
+            for (int j = 0; j < SUBSTEPS; j++) {
+                float c  = (float)j / SUBSTEPS;
+                float c2 = c * c, c3 = c2 * c;
+                float h00 =  2*c3 - 3*c2 + 1;
+                float h10 =    c3 - 2*c2 + c;
+                float h01 = -2*c3 + 3*c2;
+                float h11 =    c3 - c2;
+
+                auto f = std::unique_ptr<VROKeyframeAnimationFrame>(new VROKeyframeAnimationFrame());
+                f->time        = tau0 + dtNorm * c;
+                f->morphWeights = framesOut[k]->morphWeights;
+
+                if (isTranslationCh) {
+                    const VROVector3f &p0 = framesOut[k]->translation;
+                    const VROVector3f &p1 = framesOut[k + 1]->translation;
+                    const VROVector3f m0  = outTangentsVec3[k]     * tangentScale;
+                    const VROVector3f m1  = inTangentsVec3[k + 1]  * tangentScale;
+                    f->translation = VROVector3f(h00*p0.x + h10*m0.x + h01*p1.x + h11*m1.x,
+                                                 h00*p0.y + h10*m0.y + h01*p1.y + h11*m1.y,
+                                                 h00*p0.z + h10*m0.z + h01*p1.z + h11*m1.z);
+                }
+                if (isScaleCh) {
+                    const VROVector3f &p0 = framesOut[k]->scale;
+                    const VROVector3f &p1 = framesOut[k + 1]->scale;
+                    const VROVector3f m0  = outTangentsVec3[k]     * tangentScale;
+                    const VROVector3f m1  = inTangentsVec3[k + 1]  * tangentScale;
+                    f->scale = VROVector3f(h00*p0.x + h10*m0.x + h01*p1.x + h11*m1.x,
+                                           h00*p0.y + h10*m0.y + h01*p1.y + h11*m1.y,
+                                           h00*p0.z + h10*m0.z + h01*p1.z + h11*m1.z);
+                }
+                if (isRotationCh) {
+                    const VROQuaternion &p0 = framesOut[k]->rotation;
+                    const VROQuaternion &p1 = framesOut[k + 1]->rotation;
+                    float m0X = outTangentsQuat[k].X     * tangentScale;
+                    float m0Y = outTangentsQuat[k].Y     * tangentScale;
+                    float m0Z = outTangentsQuat[k].Z     * tangentScale;
+                    float m0W = outTangentsQuat[k].W     * tangentScale;
+                    float m1X = inTangentsQuat[k + 1].X  * tangentScale;
+                    float m1Y = inTangentsQuat[k + 1].Y  * tangentScale;
+                    float m1Z = inTangentsQuat[k + 1].Z  * tangentScale;
+                    float m1W = inTangentsQuat[k + 1].W  * tangentScale;
+                    f->rotation = VROQuaternion(
+                        h00*p0.X + h10*m0X + h01*p1.X + h11*m1X,
+                        h00*p0.Y + h10*m0Y + h01*p1.Y + h11*m1Y,
+                        h00*p0.Z + h10*m0Z + h01*p1.Z + h11*m1Z,
+                        h00*p0.W + h10*m0W + h01*p1.W + h11*m1W);
+                    f->rotation.normalize();
+                }
+                resampled.push_back(std::move(f));
+            }
+        }
+
+        // Append the final original keyframe.
+        auto last = std::unique_ptr<VROKeyframeAnimationFrame>(new VROKeyframeAnimationFrame());
+        last->time        = framesOut.back()->time;
+        last->translation = framesOut.back()->translation;
+        last->scale       = framesOut.back()->scale;
+        last->rotation    = framesOut.back()->rotation;
+        last->morphWeights = framesOut.back()->morphWeights;
+        resampled.push_back(std::move(last));
+
+        framesOut = std::move(resampled);
+    }
+
     return true;
 }
 
 bool VROGLTFLoader::processSkeletalAnimation(const tinygltf::Model &model,
-                                     std::map<int, std::pair<int, std::vector<int>>> &skeletalAnimToSkinToNodeMap) {
+                                     std::map<int, std::vector<std::pair<int, std::vector<int>>>> &skeletalAnimToSkinToNodeMap) {
     if (skeletalAnimToSkinToNodeMap.size() == 0) {
         return true;
     }
 
-    flattenSkeletalKeyframeAnimations(skeletalAnimToSkinToNodeMap);
+    // Build a per-skin flatten map (the original single-skin type) and flatten each skin's
+    // channels independently, then process each (animation, skin) pair.
+    for (auto &animEntry : skeletalAnimToSkinToNodeMap) {
+        int skeletalAnimationIndex = animEntry.first;
 
-    // First, iterate through each skeletal animation that is associated with each
-    // skinner in the scene. Also assume that an animation can only move a single
-    // skinner at a time (multi-skinner-animation for a single animation is not supported)
-    for (auto &animToSkinToNodePair : skeletalAnimToSkinToNodeMap) {
-        int skinIndex = animToSkinToNodePair.second.first;
-        int skeletalAnimationIndex = animToSkinToNodePair.first;
-        
-        int rootJointIndexForSkin = _skinIndexToSkeletonRootJoint[skinIndex];
-        int animatedNodeIndexFirst = _skinIndexToJointNodeIndex[skinIndex][rootJointIndexForSkin];
+        // Iterate every skin driven by this animation.
+        for (auto &skinPair : animEntry.second) {
+            int skinIndex = skinPair.first;
+            std::vector<int> &intersectingJoints = skinPair.second;
 
-        // For the current skeletal animation, grab first joint/Node, and then grab
-        // it's vec of VROKeyframeAnimations. (This is because at this point, a given
-        // joint can have different animated properties with different input time samples).
-        std::vector<std::shared_ptr<VROKeyframeAnimation>> animatedChannels;
-        animatedChannels = _nodeKeyFrameAnims[animatedNodeIndexFirst][skeletalAnimationIndex];
+            // Build a single-skin flatten map for this (animation, skin) pair and flatten it.
+            std::map<int, std::pair<int, std::vector<int>>> singleSkinMap;
+            singleSkinMap[skeletalAnimationIndex] = std::make_pair(skinIndex, intersectingJoints);
+            flattenSkeletalKeyframeAnimations(singleSkinMap, skinIndex);
 
-        // If there are no animations for the root node, keep iterating until we find one.
-        // We are assuming here that the animation for this skinner has the same
-        // duration and keyframe intervals for all of its bones.
-        if (animatedChannels.size() == 0) {
-            std::vector<int> intersectingAnimatedJoints = animToSkinToNodePair.second.second;
-            for (auto jointIndex : intersectingAnimatedJoints) {
-                animatedChannels = _nodeKeyFrameAnims[jointIndex][skeletalAnimationIndex];
-                if (animatedChannels.size() != 0) {
-                    break;
+            int rootJointIndexForSkin = _skinIndexToSkeletonRootJoint[skinIndex];
+            int animatedNodeIndexFirst = _skinIndexToJointNodeIndex[skinIndex][rootJointIndexForSkin];
+
+            // Grab keyframe channels for the root joint (or any joint if root has none).
+            std::vector<std::shared_ptr<VROKeyframeAnimation>> animatedChannels;
+            animatedChannels = _nodeKeyFrameAnims[animatedNodeIndexFirst][skeletalAnimationIndex];
+            if (animatedChannels.size() == 0) {
+                for (auto jointNodeIdx : intersectingJoints) {
+                    animatedChannels = _nodeKeyFrameAnims[jointNodeIdx][skeletalAnimationIndex];
+                    if (animatedChannels.size() != 0) {
+                        break;
+                    }
                 }
             }
-        }
 
-        // For each animatedProperty, construct a corresponding skeletal animation.
-        if (animatedChannels.size() > 1) {
-            pwarn("Viro: Animations with multi-time interval inputs are not yet supported!");
-        } else if (animatedChannels.size() == 0) {
-            pwarn("Viro: No animations found!");
-            return true;
-        }
-
-        // TODO: There can be cases where there are multiple animated properties with different
-        // keyframe interval durations (for example, translation animates at a different speed
-        // than rotation, towards the same duration, for the same animation). Thus, in this case
-        // we'll need to combine the different skeletal animations into a layered skeletal
-        // animation. For the moment, we simply not include the data (only consider the first index)
-        int channelIndex = 0;
-
-        // First, create a set of skeletal Frames, populate them with empty key frames (with time stamp data)
-        std::shared_ptr<VROKeyframeAnimation> keyFrameAnim = animatedChannels[channelIndex];
-        float totalDuration = keyFrameAnim->getDuration();
-        std::vector<std::unique_ptr<VROSkeletalAnimationFrame>> skeletalFrames;
-        const std::vector<std::unique_ptr<VROKeyframeAnimationFrame>> &frames = keyFrameAnim->getFrames();
-        for (int i = 0; i < frames.size(); i++) {
-            std::unique_ptr<VROSkeletalAnimationFrame> skeletalFrame = std::unique_ptr<VROSkeletalAnimationFrame>(new VROSkeletalAnimationFrame());
-            skeletalFrame->time = frames[i]->time;
-
-            // TODO We should support the non-legacy (concatenated transform) format
-            skeletalFrame->boneTransformsLegacy = true;
-            skeletalFrames.push_back(std::move(skeletalFrame));
-        }
-
-        // Then iterate through each frame and populate them with the computed transform for each joint/bone.
-        std::shared_ptr<VROSkeleton> currentSkeleton = _skinIndexToSkeleton[skinIndex];
-        std::shared_ptr<VROSkinner> currentSkinner = _skinMap[skinIndex];
-        for (int i = 0; i < frames.size(); i++) {
-            std::map<int, VROMatrix4f> computedAnimatedJointTrans;
-            if (!processSkeletalTransformsForFrame(model, skinIndex, skeletalAnimationIndex, channelIndex, i, 0,
-                                                       computedAnimatedJointTrans)) {
-                return false;
+            if (animatedChannels.size() == 0) {
+                pwarn("Viro: No animations found for skin %d in animation %d", skinIndex, skeletalAnimationIndex);
+                continue;
             }
 
-            // Then, for each joint, move the transform the computed joint back into bone space
-            // and save that into the skeletalFrames for the animation.
-            for (int jointI = 0; jointI < computedAnimatedJointTrans.size(); jointI++) {
-                VROMatrix4f invBind = _skinMap[skinIndex]->getSkeleton()->getBone(jointI)->getBindTransform();
-                VROMatrix4f computedAnimatedBoneTrans = invBind.multiply(computedAnimatedJointTrans[jointI]);
-                skeletalFrames[i]->boneIndices.push_back(jointI);
-                skeletalFrames[i]->boneTransforms.push_back(computedAnimatedBoneTrans);
+            // Pick the channel with the most keyframes as the authoritative time base.
+            int channelIndex = 0;
+            if (animatedChannels.size() > 1) {
+                size_t maxFrames = 0;
+                for (int ci = 0; ci < (int)animatedChannels.size(); ci++) {
+                    size_t n = animatedChannels[ci]->getFrames().size();
+                    if (n > maxFrames) { maxFrames = n; channelIndex = ci; }
+                }
             }
-        }
 
-        // Finally construct our skeletal animation
-        std::shared_ptr<VROSkeletalAnimation> skeletalAnimation
-                = std::make_shared<VROSkeletalAnimation>(currentSkinner, skeletalFrames, totalDuration);
-        skeletalAnimation->setName(keyFrameAnim->getName());
-        _skinSkeletalAnims[skinIndex].push_back(skeletalAnimation);
+            std::shared_ptr<VROKeyframeAnimation> keyFrameAnim = animatedChannels[channelIndex];
+            float totalDuration = keyFrameAnim->getDuration();
+            std::vector<std::unique_ptr<VROSkeletalAnimationFrame>> skeletalFrames;
+            const std::vector<std::unique_ptr<VROKeyframeAnimationFrame>> &frames = keyFrameAnim->getFrames();
+            for (int i = 0; i < (int)frames.size(); i++) {
+                std::unique_ptr<VROSkeletalAnimationFrame> skeletalFrame =
+                    std::unique_ptr<VROSkeletalAnimationFrame>(new VROSkeletalAnimationFrame());
+                skeletalFrame->time = frames[i]->time;
+                // Legacy mode: boneTransforms store (glTF_IBM * worldAnimatedJoint), and VROSkinner
+                // applies inv(IBM) * transform * IBM = worldAnimated * IBM — correct glTF skinning.
+                skeletalFrame->boneTransformsLegacy = true;
+                skeletalFrames.push_back(std::move(skeletalFrame));
+            }
 
-        // Remove any KeyFrameAnimations that were "turned into" and used for skeletal animations.
-        // If an animation is on a skinner node, it is always treated as a skeletal animation.
-        for (auto &jointNode : _skinIndexToJointNodeIndex[skinIndex]) {
-            int nodeIndex = jointNode.second;
-            _nodeKeyFrameAnims[nodeIndex][skeletalAnimationIndex].clear();
+            std::shared_ptr<VROSkinner> currentSkinner = _skinMap[skinIndex];
+            for (int i = 0; i < (int)frames.size(); i++) {
+                std::map<int, VROMatrix4f> computedAnimatedJointTrans;
+                if (!processSkeletalTransformsForFrame(model, skinIndex, skeletalAnimationIndex,
+                                                       channelIndex, i, rootJointIndexForSkin, computedAnimatedJointTrans)) {
+                    return false;
+                }
+                // Iterate by actual joint keys (not 0..size-1) to correctly handle skeletons
+                // whose root joint is not at index 0.
+                for (auto &entry : computedAnimatedJointTrans) {
+                    int jointI = entry.first;
+                    VROMatrix4f invBind = _skinMap[skinIndex]->getSkeleton()->getBone(jointI)->getBindTransform();
+                    VROMatrix4f computedAnimatedBoneTrans = invBind.multiply(entry.second);
+                    skeletalFrames[i]->boneIndices.push_back(jointI);
+                    skeletalFrames[i]->boneTransforms.push_back(computedAnimatedBoneTrans);
+                }
+            }
+
+            std::shared_ptr<VROSkeletalAnimation> skeletalAnimation =
+                std::make_shared<VROSkeletalAnimation>(currentSkinner, skeletalFrames, totalDuration);
+            skeletalAnimation->setName(keyFrameAnim->getName());
+            _skinSkeletalAnims[skinIndex].push_back(skeletalAnimation);
+
+            // Do NOT clear joint-node keyframe animations here. Keeping them on the VRONodes
+            // allows rigid-body meshes that are children of joint nodes to inherit the correct
+            // world transform during skeletal animation (their parent joint VRONode gets its
+            // TRS updated, propagating the transform down the scene graph hierarchy).
+            // Skinned meshes are unaffected — their vertex positions come entirely from the
+            // bone UBO in the shader, not from node world-transform inheritance.
         }
     }
     return true;
@@ -889,8 +1314,9 @@ bool VROGLTFLoader::processSkeletalAnimation(const tinygltf::Model &model,
    one is used.
 
  */
-void VROGLTFLoader::flattenSkeletalKeyframeAnimations(std::map<int, std::pair<int, std::vector<int>>> &skeletalAnimToNodeSkinPair) {
-    // Iterate through each skeletal animation and flattern them if possible.
+void VROGLTFLoader::flattenSkeletalKeyframeAnimations(std::map<int, std::pair<int, std::vector<int>>> &skeletalAnimToNodeSkinPair,
+                                                     int skinIndex) {
+    // Iterate through each skeletal animation and flatten them if possible.
     for (auto &animToSkinToNodePair : skeletalAnimToNodeSkinPair) {
         int skeletalAnimationIndex = animToSkinToNodePair.first;
 
@@ -917,14 +1343,22 @@ void VROGLTFLoader::flattenSkeletalKeyframeAnimations(std::map<int, std::pair<in
                 chosenNumberOfFrames = (int) keyframeAnimations.front()->getFrames().size();
             }
 
-            // Remove the keyframe animations for this node with different time input data
-            // (different animation duration and keyframe count).
+            // Remove keyframe animations with different time input data (different duration or
+            // frame count). Layered skeletal animations with mismatched time grids are not yet
+            // supported, so we keep only the majority time grid (chosenDuration/chosenNumberOfFrames).
             keyframeAnimations.erase(std::remove_if(
                             keyframeAnimations.begin(),
                             keyframeAnimations.end(),
-                            [chosenDuration, chosenNumberOfFrames](const std::shared_ptr<VROKeyframeAnimation> & o) {
-                                pwarn("Viro: Removing mis-matching animation - layered skeletal animations not yet supported for gLTF.");
-                                return o->getDuration() != chosenDuration || o->getFrames().size() != chosenNumberOfFrames;}),
+                            [chosenDuration, chosenNumberOfFrames](const std::shared_ptr<VROKeyframeAnimation> &o) {
+                                bool mismatch = (o->getDuration() != chosenDuration ||
+                                                 o->getFrames().size() != (size_t)chosenNumberOfFrames);
+                                if (mismatch) {
+                                    pwarn("Viro: Dropping mis-matched channel (dur=%.3f frames=%zu expected dur=%.3f frames=%d) "
+                                          "— layered skeletal animations with different time grids not yet supported.",
+                                          o->getDuration(), o->getFrames().size(), chosenDuration, chosenNumberOfFrames);
+                                }
+                                return mismatch;
+                            }),
                             keyframeAnimations.end());
 
             // If there's only one keyframeAnimation for this joint, there's no need to
@@ -949,7 +1383,7 @@ void VROGLTFLoader::flattenSkeletalKeyframeAnimations(std::map<int, std::pair<in
 
             // Then iterate through all the animated properties, and for each keyframe within them
             // combine the properties into the final flattenedKeyFrames.
-            bool hasTrans, hasScale, hasRotation, hasMorph = false;
+            bool hasTrans = false, hasScale = false, hasRotation = false, hasMorph = false;
             for (int channelIndex = 0; channelIndex < keyframeAnimations.size(); channelIndex++) {
                 for (int keyFrameTime = 0; keyFrameTime < flattenedKeyFrames.size(); keyFrameTime++) {
                     const std::vector<std::unique_ptr<VROKeyframeAnimationFrame>> &currFrames = keyframeAnimations[channelIndex]->getFrames();
@@ -986,6 +1420,52 @@ void VROGLTFLoader::flattenSkeletalKeyframeAnimations(std::map<int, std::pair<in
     }
 }
 
+// Helper: read a glTF node's rest-pose TRS directly from its fields (no matrix decomposition).
+// For nodes that specify a full matrix instead of TRS, we decompose it — but animated joints
+// in glTF always use separate TRS fields, so this path is rarely hit.
+static void getNodeRestTRS(const tinygltf::Model &gModel, int nodeIndex,
+                           VROVector3f &outT, VROVector3f &outS, VROQuaternion &outR) {
+    const tinygltf::Node &n = gModel.nodes[nodeIndex];
+    outT = n.translation.size() >= 3
+        ? VROVector3f((float)n.translation[0], (float)n.translation[1], (float)n.translation[2])
+        : VROVector3f();
+    outS = n.scale.size() >= 3
+        ? VROVector3f((float)n.scale[0], (float)n.scale[1], (float)n.scale[2])
+        : VROVector3f(1, 1, 1);
+    outR = n.rotation.size() >= 4
+        ? VROQuaternion((float)n.rotation[0], (float)n.rotation[1], (float)n.rotation[2], (float)n.rotation[3])
+        : VROQuaternion();
+    if (n.matrix.size() == 16) {
+        std::vector<float> fm(n.matrix.begin(), n.matrix.end());
+        VROMatrix4f mat(&fm[0]);
+        outS = mat.extractScale();
+        outR = mat.extractRotation(outS);
+        outT = mat.extractTranslation();
+    }
+}
+
+// Helper: build a local TRS matrix for a joint, falling back to the node's rest-pose for
+// any channels not present in the animation.  Mixamo/Blender rigs typically only animate
+// rotation; without the rest-pose translation every non-root bone would collapse to the
+// origin, producing severe mesh corruption.
+static VROMatrix4f buildJointLocalTransform(const tinygltf::Model &gModel, int nodeIndex,
+                                            const VROKeyframeAnimation *anim,
+                                            const VROKeyframeAnimationFrame *frame) {
+    VROVector3f restT; VROVector3f restS; VROQuaternion restR;
+    getNodeRestTRS(gModel, nodeIndex, restT, restS, restR);
+
+    VROVector3f   scale       = anim->_hasScale       ? frame->scale       : restS;
+    VROQuaternion rotation    = anim->_hasRotation    ? frame->rotation    : restR;
+    VROVector3f   translation = anim->_hasTranslation ? frame->translation : restT;
+
+    VROMatrix4f m;
+    m.toIdentity();
+    m.scale(scale.x, scale.y, scale.z);
+    m = rotation.getMatrix() * m;
+    m.translate(translation);
+    return m;
+}
+
 bool VROGLTFLoader::processSkeletalTransformsForFrame(const tinygltf::Model &gModel,
                                                       int skin,
                                                       int animationIndex,
@@ -993,35 +1473,76 @@ bool VROGLTFLoader::processSkeletalTransformsForFrame(const tinygltf::Model &gMo
                                                       int keyFrameTime,
                                                       int currentJointIndex,
                                                       std::map<int, VROMatrix4f> &transformsOut) {
-    // If we are at the root, process its transform to be cascaded down the model's scene tree.
-    int childNodeIndex = _skinIndexToJointNodeIndex[skin][0];
+    // If we are at the root (transform not yet placed by a parent), compute and store it.
+    // Detect "root" by the absence of a pre-placed transform rather than hardcoding index 0,
+    // so models whose skeleton root joint is not at index 0 are handled correctly.
+    if (transformsOut.find(currentJointIndex) == transformsOut.end()) {
+        int rootNodeIndex = _skinIndexToJointNodeIndex[skin][currentJointIndex];
 
-    if (currentJointIndex == 0) {
-        if (_nodeKeyFrameAnims[childNodeIndex][animationIndex].size() == 0) {
-
-            // If the there are no animations configured for this bone, simply get the model's
-            // original local transform.
-            transformsOut[0] = getTransformOfNode(gModel, childNodeIndex);
-        } else {
-            std::shared_ptr<VROKeyframeAnimation> animation = _nodeKeyFrameAnims[childNodeIndex][animationIndex].at(subAnimPropertyIndex);
-            const std::vector<std::unique_ptr<VROKeyframeAnimationFrame>> &frames = animation->getFrames();
-            VROMatrix4f localTransform;
-            localTransform.toIdentity();
-            if (animation->_hasScale) {
-                localTransform.scale(frames[keyFrameTime]->scale.x,
-                                     frames[keyFrameTime]->scale.y,
-                                     frames[keyFrameTime]->scale.z);
+        // Walk up the GLTF scene graph collecting non-skin ancestor nodes.
+        // For multi-skin models the root joint of a secondary skin (e.g. visor's Neck joint)
+        // may have parent nodes that belong to the primary skin (Hips, Spine…). Those ancestors
+        // are NOT in this skin's joint list but their animated world transforms must be included
+        // so the IBM (which encodes the full world-space bind pose) is correctly cancelled out.
+        std::vector<int> nonSkinAncestors;
+        {
+            int cur = rootNodeIndex;
+            while (_nodeParentMap.count(cur)) {
+                int par = _nodeParentMap[cur];
+                // Check whether the parent node is a joint in THIS skin
+                bool inThisSkin = false;
+                for (auto &kv : _skinIndexToJointNodeIndex[skin]) {
+                    if (kv.second == par) { inThisSkin = true; break; }
+                }
+                if (inThisSkin) break;  // ancestor is already handled by the skin cascade
+                // Stop if this ancestor is already applied by Viro's renderer as the mesh
+                // node's modelMatrix (i.e. it's an ancestor of the skin's mesh node).
+                // Including it here would double-apply it (e.g. Character scale=0.01 twice).
+                if (_skinMeshAncestors.count(skin) && _skinMeshAncestors[skin].count(par)) break;
+                nonSkinAncestors.push_back(par);
+                cur = par;
             }
-
-            if (animation->_hasRotation) {
-                localTransform = frames[keyFrameTime]->rotation.getMatrix() * localTransform;
-            }
-
-            if (animation->_hasTranslation) {
-                localTransform.translate(frames[keyFrameTime]->translation);
-            }
-            transformsOut[0] = localTransform;
         }
+
+        // Build the accumulated world transform from outermost to innermost ancestor.
+        // For each ancestor, collect its TRS from all animation channels (unflattened T/R/S)
+        // falling back to the rest-pose for any channel not present in the animation.
+        VROMatrix4f ancestorWorld;
+        ancestorWorld.toIdentity();
+        for (int i = (int)nonSkinAncestors.size() - 1; i >= 0; i--) {
+            int ancNode = nonSkinAncestors[i];
+            VROVector3f ancT; VROVector3f ancS; VROQuaternion ancR;
+            getNodeRestTRS(gModel, ancNode, ancT, ancS, ancR);
+            const auto &ancAnimMap = _nodeKeyFrameAnims[ancNode];
+            auto ancAnimIt = ancAnimMap.find(animationIndex);
+            if (ancAnimIt != ancAnimMap.end()) {
+                for (const auto &ancAnim : ancAnimIt->second) {
+                    if (keyFrameTime >= (int)ancAnim->getFrames().size()) continue;
+                    const auto &ancFrame = *ancAnim->getFrames()[keyFrameTime];
+                    if (ancAnim->_hasTranslation) ancT = ancFrame.translation;
+                    if (ancAnim->_hasRotation)    ancR = ancFrame.rotation;
+                    if (ancAnim->_hasScale)       ancS = ancFrame.scale;
+                }
+            }
+            VROMatrix4f ancLocal;
+            ancLocal.toIdentity();
+            ancLocal.scale(ancS.x, ancS.y, ancS.z);
+            ancLocal = ancR.getMatrix() * ancLocal;
+            ancLocal.translate(ancT);
+            ancestorWorld = ancestorWorld.multiply(ancLocal);
+        }
+
+        // Compute root joint's local transform, then pre-multiply by ancestor world.
+        const auto &anims = _nodeKeyFrameAnims[rootNodeIndex][animationIndex];
+        VROMatrix4f rootLocal;
+        if (anims.empty()) {
+            rootLocal = getTransformOfNode(gModel, rootNodeIndex);
+        } else {
+            const auto &anim = anims.at(subAnimPropertyIndex);
+            const auto &frame = *anim->getFrames()[keyFrameTime];
+            rootLocal = buildJointLocalTransform(gModel, rootNodeIndex, anim.get(), &frame);
+        }
+        transformsOut[currentJointIndex] = ancestorWorld.multiply(rootLocal);
     }
 
     // Grab the transform of the current joint to be cascaded and multiplied on the child.
@@ -1030,33 +1551,20 @@ bool VROGLTFLoader::processSkeletalTransformsForFrame(const tinygltf::Model &gMo
     // Grab all the child joints for this current joint.
     std::vector<int> childJoints = _skinIndexToJointChildJoints[skin][currentJointIndex];
     for (int childJointIndex : childJoints) {
-        // Get the actual node index for the child joint Index and it's animation to set.
         int childNodeIndex = _skinIndexToJointNodeIndex[skin][childJointIndex];
+        const auto &anims = _nodeKeyFrameAnims[childNodeIndex][animationIndex];
 
-        VROMatrix4f localTransform = VROMatrix4f::identity();
-        if (_nodeKeyFrameAnims[childNodeIndex][animationIndex].size() == 0) {
+        VROMatrix4f localTransform;
+        if (anims.empty()) {
             localTransform = getTransformOfNode(gModel, childNodeIndex);
         } else {
-            // Grab the animation transform of the current keyFrame
-            std::shared_ptr<VROKeyframeAnimation> animation = _nodeKeyFrameAnims[childNodeIndex][animationIndex].at(subAnimPropertyIndex);
-            const std::vector<std::unique_ptr<VROKeyframeAnimationFrame>> &frames = animation->getFrames();
-            if (animation->_hasScale) {
-                localTransform.scale(frames[keyFrameTime]->scale.x,
-                                     frames[keyFrameTime]->scale.y,
-                                     frames[keyFrameTime]->scale.z);
-            }
-            if (animation->_hasRotation) {
-                localTransform = frames[keyFrameTime]->rotation.getMatrix() * localTransform;
-            }
-
-            if (animation->_hasTranslation) {
-                localTransform.translate(frames[keyFrameTime]->translation);
-            }
+            const auto &anim = anims.at(subAnimPropertyIndex);
+            const auto &frame = *anim->getFrames()[keyFrameTime];
+            localTransform = buildJointLocalTransform(gModel, childNodeIndex, anim.get(), &frame);
         }
-        
-        // Now cascade and compute the actual world computed transform in model space, save it in transformsOut
-        VROMatrix4f computedJointTransformInMeshCoords = currentMatrix.multiply(localTransform);
-        transformsOut[childJointIndex] = computedJointTransformInMeshCoords;
+
+        // Cascade: world transform = parent_world * local
+        transformsOut[childJointIndex] = currentMatrix.multiply(localTransform);
 
         // Continue going down the skeletal tree
         if (!processSkeletalTransformsForFrame(gModel, skin, animationIndex, subAnimPropertyIndex,
@@ -1159,21 +1667,81 @@ bool VROGLTFLoader::processNode(const tinygltf::Model &gModel, std::shared_ptr<V
     node->setRotation(rot);
     node->setName(gNode.name);
 
+    // Record the VRONode and its bind-pose TRS for nodes that have keyframe animations.
+    // injectBindPoseAnimations() uses this after all nodes are processed to add single-frame
+    // bind-pose reset animations for animation names a node doesn't participate in —
+    // preventing joints from retaining stale transforms when animations are switched.
+    if (_nodeKeyFrameAnims.find(gNodeIndex) != _nodeKeyFrameAnims.end()) {
+        _nodeGLTFMap[gNodeIndex] = node;
+        _nodeBindPos[gNodeIndex]   = pos;
+        _nodeBindScale[gNodeIndex] = scale;
+        _nodeBindRot[gNodeIndex]   = rot;
+    }
+
     // Process the Geometry for this node, if any.
     // Fail fast if we have failed to process the node's mesh.
     int meshIndex = gNode.mesh;
-    if (meshIndex >= 0 && !processMesh(gModel, node, gModel.meshes[meshIndex], driver)) {
+    if (meshIndex >= 0 && !processMesh(gModel, node, gModel.meshes[meshIndex], meshIndex, driver)) {
+        return false;
+    }
+
+    // Process the Camera for this node, if any (glTF 2.0 camera support).
+    int cameraIndex = gNode.camera;
+    if (cameraIndex >= 0 && !processCamera(gModel, node, cameraIndex)) {
+        return false;
+    }
+
+    // Process the Light for this node, if any (KHR_lights_punctual extension).
+    int lightIndex = gNode.light;
+    if (lightIndex >= 0 && !processLight(gModel, node, lightIndex)) {
         return false;
     }
 
     // After processing the nodes of this model, process skins if any.
     std::shared_ptr<VROGeometry> geom = node->getGeometry();
-    if (geom != nullptr && gNode.skin >=0) {
-        _skinMap[gNode.skin]->setSkinnerNode(node);
-        geom->setSkinner(_skinMap[gNode.skin]);
+    if (geom != nullptr && gNode.skin >= 0) {
+        int skinIndex = gNode.skin;
+
+        // Retrieve bone attribute sources that were cached by processMesh for this mesh.
+        // These are the JOINTS_0 and WEIGHTS_0 data that map each vertex to its influencing
+        // bones — required for GPU skeletal deformation. Rebuild the VROSkinner with them so
+        // the vertex shader receives correct bone index / weight data.
+        std::shared_ptr<VROGeometrySource> boneIndices;
+        std::shared_ptr<VROGeometrySource> boneWeights;
+        auto idxIt = _meshBoneIndices.find(meshIndex);
+        auto wgtIt = _meshBoneWeights.find(meshIndex);
+        if (idxIt != _meshBoneIndices.end()) boneIndices = idxIt->second;
+        if (wgtIt != _meshBoneWeights.end()) boneWeights = wgtIt->second;
+
+        if (!boneIndices || !boneWeights) {
+            pwarn("Skinner for mesh %d / skin %d is missing bone index or weight data — "
+                  "skeletal deformation will not work.", meshIndex, skinIndex);
+        }
+
+        std::shared_ptr<VROSkeleton> skeleton  = _skinMap[skinIndex]->getSkeleton();
+        // Use getBindTransforms() (= the IBM values from the GLTF file) as boneSpaceTransforms
+        // so the new VROSkinner stores _bindTransforms = IBM and _inverseBindTransforms = IBM.invert().
+        // getInverseBindTransforms() would return IBM.invert(), producing an inverted skinner and
+        // corrupted skeletal deformation (IBM applied twice, wrong direction).
+        const std::vector<VROMatrix4f> &bindTransforms = _skinMap[skinIndex]->getBindTransforms();
+        std::shared_ptr<VROSkinner> skinner = std::make_shared<VROSkinner>(
+            skeleton, VROMatrix4f(), bindTransforms, boneIndices, boneWeights);
+        _skinMap[skinIndex] = skinner;
+
+        skinner->setSkinnerNode(node);
+        geom->setSkinner(skinner);
         for (const std::shared_ptr<VROMaterial> &material : geom->getMaterials()) {
             material->addShaderModifier(VROBoneUBO::createSkinningShaderModifier(false));
         }
+
+        // The bone UBO already encodes world-space vertex positions including all ancestor
+        // transforms (via nonSkinAncestors in processSkeletalTransformsForFrame). The vertex
+        // shader multiplies by model_matrix on top of the skinned result, which would
+        // double-apply any non-identity node transform (e.g. Hand.R/Hand.L scale=100).
+        // Reset the skinned mesh node to identity so model_matrix = I in the shader.
+        node->setPosition({0, 0, 0});
+        node->setScale({1, 1, 1});
+        node->setRotation(VROQuaternion());
     }
 
     // Set the animations on this node, if any.
@@ -1203,6 +1771,144 @@ bool VROGLTFLoader::processNode(const tinygltf::Model &gModel, std::shared_ptr<V
             return false;
         }
     }
+    return true;
+}
+
+bool VROGLTFLoader::processCamera(const tinygltf::Model &gModel, std::shared_ptr<VRONode> &node, int cameraIndex) {
+    if (cameraIndex < 0 || cameraIndex >= gModel.cameras.size()) {
+        pwarn("Invalid camera index: %d", cameraIndex);
+        return false;
+    }
+
+    const tinygltf::Camera &gCamera = gModel.cameras[cameraIndex];
+    std::shared_ptr<VRONodeCamera> camera = std::make_shared<VRONodeCamera>();
+
+    if (gCamera.type == "perspective") {
+        camera->setProjectionType(VROCameraProjectionType::Perspective);
+
+        const tinygltf::PerspectiveCamera &persp = gCamera.perspective;
+
+        // glTF yfov is in radians, VRONodeCamera expects degrees
+        float fovDegrees = persp.yfov * (180.0f / M_PI);
+        camera->setFieldOfViewY(fovDegrees);
+
+        camera->setNearClippingPlane(persp.znear);
+
+        // zfar of 0 means infinite projection (optional in glTF spec)
+        if (persp.zfar > 0) {
+            camera->setFarClippingPlane(persp.zfar);
+        } else {
+            // Use a large default for infinite projection
+            camera->setFarClippingPlane(10000.0f);
+        }
+
+        // aspectRatio is optional; 0 means use viewport aspect
+        if (persp.aspectRatio > 0) {
+            camera->setAspectRatio(persp.aspectRatio);
+        }
+
+        pinfo("Loaded perspective camera '%s': fov=%.1f°, near=%.3f, far=%.1f",
+              gCamera.name.c_str(), fovDegrees, persp.znear, persp.zfar);
+
+    } else if (gCamera.type == "orthographic") {
+        camera->setProjectionType(VROCameraProjectionType::Orthographic);
+
+        const tinygltf::OrthographicCamera &ortho = gCamera.orthographic;
+
+        camera->setOrthographicWidth(ortho.xmag);
+        camera->setOrthographicHeight(ortho.ymag);
+        camera->setNearClippingPlane(ortho.znear);
+        camera->setFarClippingPlane(ortho.zfar);
+
+        pinfo("Loaded orthographic camera '%s': xmag=%.2f, ymag=%.2f, near=%.3f, far=%.1f",
+              gCamera.name.c_str(), ortho.xmag, ortho.ymag, ortho.znear, ortho.zfar);
+
+    } else {
+        pwarn("Unknown camera type: %s", gCamera.type.c_str());
+        return false;
+    }
+
+    node->setCamera(camera);
+    return true;
+}
+
+bool VROGLTFLoader::processLight(const tinygltf::Model &gModel, std::shared_ptr<VRONode> &node, int lightIndex) {
+    if (lightIndex < 0 || lightIndex >= gModel.lights.size()) {
+        pwarn("Invalid light index: %d", lightIndex);
+        return false;
+    }
+
+    const tinygltf::Light &gLight = gModel.lights[lightIndex];
+
+    // Map glTF light type to VROLightType
+    VROLightType lightType;
+    if (gLight.type == "directional") {
+        lightType = VROLightType::Directional;
+    } else if (gLight.type == "point") {
+        lightType = VROLightType::Omni;
+    } else if (gLight.type == "spot") {
+        lightType = VROLightType::Spot;
+    } else {
+        pwarn("Unknown light type: %s", gLight.type.c_str());
+        return false;
+    }
+
+    std::shared_ptr<VROLight> light = std::make_shared<VROLight>(lightType);
+
+    // Set light name
+    if (!gLight.name.empty()) {
+        light->setName(gLight.name);
+    }
+
+    // Set light color (glTF uses linear RGB)
+    if (gLight.color.size() >= 3) {
+        light->setColor({(float)gLight.color[0], (float)gLight.color[1], (float)gLight.color[2]});
+    }
+
+    // Set light intensity
+    // glTF uses candela for point/spot lights, lux for directional lights
+    // ViroCore intensity is typically 0-1000, so we map accordingly
+    // For now, pass through the intensity directly as ViroCore can handle various ranges
+    light->setIntensity((float)gLight.intensity * 1000.0f);
+
+    // Set attenuation based on range for point and spot lights
+    if (lightType == VROLightType::Omni || lightType == VROLightType::Spot) {
+        if (gLight.range > 0) {
+            // Use range as the end distance for attenuation
+            light->setAttenuationStartDistance(0.0f);
+            light->setAttenuationEndDistance((float)gLight.range);
+        }
+
+        // For point/spot lights, the light position is the node position (handled by transform)
+        // Direction for directional/spot lights is -Z in local space, handled by node rotation
+    }
+
+    // Set spot light cone angles
+    if (lightType == VROLightType::Spot) {
+        // glTF angles are in radians from the center axis, ViroCore uses full cone angles in degrees
+        // glTF: innerConeAngle is half-angle, outerConeAngle is half-angle
+        // ViroCore: spotInnerAngle/spotOuterAngle are full cone angles in degrees
+        float innerAngleDegrees = (float)(gLight.innerConeAngle * 2.0 * 180.0 / M_PI);
+        float outerAngleDegrees = (float)(gLight.outerConeAngle * 2.0 * 180.0 / M_PI);
+
+        light->setSpotInnerAngle(innerAngleDegrees);
+        light->setSpotOuterAngle(outerAngleDegrees);
+    }
+
+    // For directional and spot lights, set the default direction to -Z (glTF convention)
+    if (lightType == VROLightType::Directional || lightType == VROLightType::Spot) {
+        light->setDirection({0, 0, -1});
+    }
+
+    node->addLight(light);
+
+    pinfo("Loaded %s light '%s': color=(%.2f,%.2f,%.2f), intensity=%.1f",
+          gLight.type.c_str(), gLight.name.c_str(),
+          gLight.color.size() >= 3 ? gLight.color[0] : 1.0,
+          gLight.color.size() >= 3 ? gLight.color[1] : 1.0,
+          gLight.color.size() >= 3 ? gLight.color[2] : 1.0,
+          gLight.intensity);
+
     return true;
 }
 
@@ -1260,7 +1966,7 @@ bool VROGLTFLoader::processSkinnerInverseBindData(const tinygltf::Model &gModel,
 }
 
 bool VROGLTFLoader::processMesh(const tinygltf::Model &gModel, std::shared_ptr<VRONode> &rootNode, const tinygltf::Mesh &gMesh,
-                                std::shared_ptr<VRODriver> driver) {
+                                int meshIndex, std::shared_ptr<VRODriver> driver) {
     if (gMesh.primitives.size() <=0) {
         perr("GTLF requires mesh data to contain at least one primitive!");
         return false;
@@ -1308,6 +2014,15 @@ bool VROGLTFLoader::processMesh(const tinygltf::Model &gModel, std::shared_ptr<V
     // Apply a default material if none has been specified.
     if (materials.size() == 0) {
         materials.push_back(std::make_shared<VROMaterial>());
+    }
+
+    // Cache JOINTS_0 / WEIGHTS_0 sources so processNode can wire them into VROSkinner.
+    for (const std::shared_ptr<VROGeometrySource> &src : sources) {
+        if (src->getSemantic() == VROGeometrySourceSemantic::BoneIndices) {
+            _meshBoneIndices[meshIndex] = src;
+        } else if (src->getSemantic() == VROGeometrySourceSemantic::BoneWeights) {
+            _meshBoneWeights[meshIndex] = src;
+        }
     }
 
     // Finally construct our geometry with the processed vertex and attribute data.
@@ -1527,10 +2242,78 @@ bool VROGLTFLoader::processVertexElement(const tinygltf::Model &gModel,
     // Grab the vertex indices for this primitive.
     int gPrimitiveIndicesIndex = gPrimitive.indices;
     if (gPrimitiveIndicesIndex < 0) {
-        // Fallback to glDrawArrays if no indexed vertices are provided.
-        // TODO VIRO-3664: Support Draw Arrays for Viro Geometry in the main render pass.
-        pwarn("Models requiring glDrawArray functionality are not yet supported");
-        return false;
+        // No indices provided - generate sequential indices for glDrawArrays equivalent
+        // Get vertex count from POSITION attribute
+        auto posIt = gPrimitive.attributes.find("POSITION");
+        if (posIt == gPrimitive.attributes.end()) {
+            perr("Non-indexed primitive requires POSITION attribute to determine vertex count");
+            return false;
+        }
+
+        const tinygltf::Accessor &posAccessor = gModel.accessors[posIt->second];
+        size_t vertexCount = posAccessor.count;
+
+        if (vertexCount == 0) {
+            perr("Non-indexed primitive has zero vertices");
+            return false;
+        }
+
+        // Determine how many indices we need based on primitive type
+        size_t indexCount = vertexCount;
+
+        // Handle TRIANGLE_FAN conversion for non-indexed case
+        if (gPrimitive.mode == TINYGLTF_MODE_TRIANGLE_FAN) {
+            if (vertexCount < 3) {
+                perr("TRIANGLE_FAN requires at least 3 vertices");
+                return false;
+            }
+            size_t numTriangles = vertexCount - 2;
+            indexCount = numTriangles * 3;
+        }
+
+        // Handle LINE_LOOP conversion for non-indexed case
+        if (gPrimitive.mode == TINYGLTF_MODE_LINE_LOOP) {
+            indexCount = vertexCount + 1; // Add one to close the loop
+        }
+
+        // Use unsigned int for indices to support large meshes
+        int bytesPerIndex = sizeof(uint32_t);
+        size_t dataLength = indexCount * bytesPerIndex;
+        uint32_t *indices = new uint32_t[indexCount];
+
+        if (gPrimitive.mode == TINYGLTF_MODE_TRIANGLE_FAN) {
+            // Generate triangle indices from fan: (0,1,2), (0,2,3), (0,3,4), ...
+            size_t numTriangles = vertexCount - 2;
+            for (size_t i = 0; i < numTriangles; i++) {
+                indices[i * 3 + 0] = 0;
+                indices[i * 3 + 1] = (uint32_t)(i + 1);
+                indices[i * 3 + 2] = (uint32_t)(i + 2);
+            }
+        } else if (gPrimitive.mode == TINYGLTF_MODE_LINE_LOOP) {
+            // Generate line indices and close the loop
+            for (size_t i = 0; i < vertexCount; i++) {
+                indices[i] = (uint32_t)i;
+            }
+            indices[vertexCount] = 0; // Close the loop
+        } else {
+            // Generate sequential indices: 0, 1, 2, 3, ...
+            for (size_t i = 0; i < vertexCount; i++) {
+                indices[i] = (uint32_t)i;
+            }
+        }
+
+        int primitiveCount = VROGeometryUtilGetPrimitiveCount((int)indexCount, primitiveType);
+        std::shared_ptr<VROData> data = std::make_shared<VROData>((void *)indices,
+                                                                  (int)dataLength,
+                                                                  VRODataOwnership::Move);
+        std::shared_ptr<VROGeometryElement> element
+                = std::make_shared<VROGeometryElement>(data,
+                                                       primitiveType,
+                                                       primitiveCount,
+                                                       bytesPerIndex,
+                                                       false); // unsigned int is not signed
+        elements.push_back(element);
+        return true;
     }
 
     // Grab the accessor that maps to a bufferView through which to view the data buffer
@@ -1561,13 +2344,109 @@ bool VROGLTFLoader::processVertexElement(const tinygltf::Model &gModel,
     }
 
     // Determine offsets and data sizes representing the indexed vertices's 'window of data' in the buffer
-    int primitiveCount = VROGeometryUtilGetPrimitiveCount((int) gIndicesAccessor.count, primitiveType);
     size_t elementCount = gIndicesAccessor.count;
     size_t dataOffset = gIndicesAccessor.byteOffset + gIndiceBufferView.byteOffset;
-    size_t dataLength = elementCount *  bufferViewStride;
+    size_t dataLength = elementCount * bufferViewStride;
 
-    // Finally, grab the raw indexed vertex data from the buffer to be created with VROGeometryElement
+    // Get the raw buffer data
     const tinygltf::Buffer &gBuffer = gModel.buffers[gIndiceBufferView.buffer];
+    const unsigned char *srcData = gBuffer.data.data() + dataOffset;
+    int bytesPerIndex = getComponentTypeSize(gTypeComponent);
+
+    // Handle LINE_LOOP: Convert to Line by appending the first index at the end
+    if (gPrimitive.mode == TINYGLTF_MODE_LINE_LOOP) {
+        size_t newElementCount = elementCount + 1;
+        size_t newDataLength = newElementCount * bytesPerIndex;
+        unsigned char *convertedData = new unsigned char[newDataLength];
+
+        // Copy original indices
+        memcpy(convertedData, srcData, dataLength);
+        // Append first index at end to close the loop
+        memcpy(convertedData + dataLength, srcData, bytesPerIndex);
+
+        int primitiveCount = (int)(newElementCount / 2);
+        std::shared_ptr<VROData> data = std::make_shared<VROData>((void *)convertedData,
+                                                                  newDataLength,
+                                                                  VRODataOwnership::Move);
+        std::shared_ptr<VROGeometryElement> element
+                = std::make_shared<VROGeometryElement>(data,
+                                                       primitiveType,
+                                                       primitiveCount,
+                                                       bytesPerIndex,
+                                                       gTypeComponent != GLTFTypeComponent::UnsignedByte &&
+                                                       gTypeComponent != GLTFTypeComponent::UnsignedShort);
+        elements.push_back(element);
+        return true;
+    }
+
+    // Handle TRIANGLE_FAN: Convert to Triangles
+    // Fan with n vertices generates (n-2) triangles: (0,1,2), (0,2,3), (0,3,4), ...
+    if (gPrimitive.mode == TINYGLTF_MODE_TRIANGLE_FAN) {
+        if (elementCount < 3) {
+            perr("TRIANGLE_FAN requires at least 3 vertices");
+            return false;
+        }
+
+        size_t numTriangles = elementCount - 2;
+        size_t newElementCount = numTriangles * 3;
+        size_t newDataLength = newElementCount * bytesPerIndex;
+        unsigned char *convertedData = new unsigned char[newDataLength];
+
+        // Read original indices into a temporary buffer for easier manipulation
+        VROByteBuffer srcBuffer((char *)srcData, dataLength, false);
+        std::vector<uint32_t> originalIndices;
+        for (size_t i = 0; i < elementCount; i++) {
+            srcBuffer.setPosition(i * bytesPerIndex);
+            uint32_t index;
+            if (bytesPerIndex == 1) {
+                index = srcBuffer.readUnsignedByte();
+            } else if (bytesPerIndex == 2) {
+                index = srcBuffer.readUnsignedShort();
+            } else {
+                index = srcBuffer.readUnsignedInt();
+            }
+            originalIndices.push_back(index);
+        }
+
+        // Generate triangle indices from the fan
+        VROByteBuffer dstBuffer((char *)convertedData, newDataLength, false);
+        for (size_t i = 0; i < numTriangles; i++) {
+            uint32_t i0 = originalIndices[0];
+            uint32_t i1 = originalIndices[i + 1];
+            uint32_t i2 = originalIndices[i + 2];
+
+            if (bytesPerIndex == 1) {
+                dstBuffer.writeUnsignedByte((unsigned char)i0);
+                dstBuffer.writeUnsignedByte((unsigned char)i1);
+                dstBuffer.writeUnsignedByte((unsigned char)i2);
+            } else if (bytesPerIndex == 2) {
+                dstBuffer.writeUnsignedShort((unsigned short)i0);
+                dstBuffer.writeUnsignedShort((unsigned short)i1);
+                dstBuffer.writeUnsignedShort((unsigned short)i2);
+            } else {
+                dstBuffer.writeUnsignedInt(i0);
+                dstBuffer.writeUnsignedInt(i1);
+                dstBuffer.writeUnsignedInt(i2);
+            }
+        }
+
+        int primitiveCount = (int)numTriangles;
+        std::shared_ptr<VROData> data = std::make_shared<VROData>((void *)convertedData,
+                                                                  newDataLength,
+                                                                  VRODataOwnership::Move);
+        std::shared_ptr<VROGeometryElement> element
+                = std::make_shared<VROGeometryElement>(data,
+                                                       primitiveType,
+                                                       primitiveCount,
+                                                       bytesPerIndex,
+                                                       gTypeComponent != GLTFTypeComponent::UnsignedByte &&
+                                                       gTypeComponent != GLTFTypeComponent::UnsignedShort);
+        elements.push_back(element);
+        return true;
+    }
+
+    // Standard case: directly use the buffer data
+    int primitiveCount = VROGeometryUtilGetPrimitiveCount((int) gIndicesAccessor.count, primitiveType);
     std::shared_ptr<VROData> data = std::make_shared<VROData>((void *)gBuffer.data.data(),
                                                               dataLength,
                                                               dataOffset);
@@ -1575,7 +2454,7 @@ bool VROGLTFLoader::processVertexElement(const tinygltf::Model &gModel,
             = std::make_shared<VROGeometryElement>(data,
                                                    primitiveType,
                                                    primitiveCount,
-                                                   getComponentTypeSize(gTypeComponent),
+                                                   bytesPerIndex,
                                                    gTypeComponent != GLTFTypeComponent::UnsignedByte &&
                                                    gTypeComponent != GLTFTypeComponent::UnsignedShort);
     elements.push_back(element);
@@ -1704,7 +2583,7 @@ bool VROGLTFLoader::processMorphTargets(const tinygltf::Model &gModel,
         }
 
         // Grab the rest of the target's properties.
-        std::string key = getMorphTargetName(gModel, gPrimitive, targetIndex);
+        std::string key = getMorphTargetName(gModel, gMesh, gPrimitive, targetIndex);
         float weight = 0.0;
         if (targetIndex < gMesh.weights.size()) {
             weight = gMesh.weights[targetIndex];
@@ -1719,11 +2598,25 @@ bool VROGLTFLoader::processMorphTargets(const tinygltf::Model &gModel,
 }
 
 std::string VROGLTFLoader::getMorphTargetName(const tinygltf::Model &gModel,
+                                              const tinygltf::Mesh &gMesh,
                                               const tinygltf::Primitive &gPrimitive,
                                               int targetIndex) {
-    std::string key = VROStringUtil::toString(targetIndex);
+    // Standard glTF convention (Blender, Three.js): morph target names live in
+    // mesh.extras.targetNames as a JSON array.  Check this first before falling
+    // back to accessor names, which are usually empty.
+    const tinygltf::Value &extras = gMesh.extras;
+    if (extras.IsObject() && extras.Has("targetNames")) {
+        const tinygltf::Value &targetNames = extras.Get("targetNames");
+        if (targetNames.IsArray() && targetIndex < (int)targetNames.ArrayLen()) {
+            const tinygltf::Value &nameVal = targetNames.Get(targetIndex);
+            if (nameVal.IsString()) {
+                return nameVal.Get<std::string>();
+            }
+        }
+    }
 
-    // Iterate through the property accessors of the mesh target to grab it's name.
+    // Fall back to accessor name (some exporters store the name there).
+    std::string key = VROStringUtil::toString(targetIndex);
     std::map<std::string, int> gAttributes = gPrimitive.targets[targetIndex];
     if (gAttributes.size() > 0) {
         for (auto const& gAttribute : gAttributes) {
@@ -1798,7 +2691,7 @@ std::shared_ptr<VROGeometrySource> VROGLTFLoader::buildBoneWeightSource(GLTFType
         
         // For the current element, cycle through each of its float or type component
         // and convert them into a float through the math conversions required by gLTF.
-        buffer.setPosition(elementIndex * bufferViewStride);
+        buffer.setPosition(elementIndex * bufferViewStride + gAttributeAccesor.byteOffset);
         std::vector<float> weight;
         for (int componentCount = 0; componentCount < getTypeSize(gType); componentCount++) {
             if (gTypeComponent == GLTFTypeComponent::Float) {
@@ -1852,12 +2745,28 @@ std::shared_ptr<VROMaterial> VROGLTFLoader::getMaterial(const tinygltf::Model &g
     std::shared_ptr<VROTexture> normalTexture = getTexture(gModel, gAdditionalMap, "normalTexture", false);
     if (normalTexture != nullptr) {
         vroMat->getNormal().setTexture(normalTexture);
+        // Parse normal texture scale (default 1.0 per glTF spec)
+        if (gAdditionalMap.find("normalTexture") != gAdditionalMap.end()) {
+            const tinygltf::Parameter &normalParam = gAdditionalMap["normalTexture"];
+            auto scaleIt = normalParam.json_double_value.find("scale");
+            if (scaleIt != normalParam.json_double_value.end()) {
+                vroMat->getNormal().setIntensity((float)scaleIt->second);
+            }
+        }
     }
 
     // Process Occlusion Textures
     std::shared_ptr<VROTexture> occlusionTexture = getTexture(gModel, gAdditionalMap, "occlusionTexture", false);
     if (occlusionTexture != nullptr) {
         vroMat->getAmbientOcclusion().setTexture(occlusionTexture);
+        // Parse occlusion texture strength (default 1.0 per glTF spec)
+        if (gAdditionalMap.find("occlusionTexture") != gAdditionalMap.end()) {
+            const tinygltf::Parameter &occlusionParam = gAdditionalMap["occlusionTexture"];
+            auto strengthIt = occlusionParam.json_double_value.find("strength");
+            if (strengthIt != occlusionParam.json_double_value.end()) {
+                vroMat->getAmbientOcclusion().setIntensity((float)strengthIt->second);
+            }
+        }
     }
 
     // Process GLTF transparency modes
@@ -1869,13 +2778,40 @@ std::shared_ptr<VROMaterial> VROGLTFLoader::getMaterial(const tinygltf::Model &g
     if (VROStringUtil::strcmpinsensitive(mode, "OPAQUE")) {
         vroMat->setTransparencyMode(VROTransparencyMode::RGBZero);
     } else if (VROStringUtil::strcmpinsensitive(mode, "MASK")) {
-        // TODO VIRO-3684: Implement Transparent Masks, fallback to Alpha transparency for now.
-        vroMat->setTransparencyMode(VROTransparencyMode::AOne);
+        vroMat->setTransparencyMode(VROTransparencyMode::Mask);
+        // Parse alphaCutoff, default is 0.5 per glTF spec
+        float alphaCutoff = 0.5f;
+        if (gAdditionalMap.find("alphaCutoff") != gAdditionalMap.end()) {
+            alphaCutoff = (float)gAdditionalMap["alphaCutoff"].Factor();
+        }
+        vroMat->setAlphaCutoff(alphaCutoff);
     } else if (VROStringUtil::strcmpinsensitive(mode, "BLEND")) {
         vroMat->setTransparencyMode(VROTransparencyMode::AOne);
     }
 
-    // TODO VIRO-3683: Implement GLTF Emissive Maps
+    // Process emissive material properties
+    // Emissive factor defaults to [0, 0, 0] (no emission)
+    if (gAdditionalMap.find("emissiveFactor") != gAdditionalMap.end()) {
+        std::vector<double> emissiveFactor = gAdditionalMap["emissiveFactor"].number_array;
+        if (emissiveFactor.size() >= 3) {
+            VROVector4f emissiveColor((float)emissiveFactor[0], (float)emissiveFactor[1],
+                                      (float)emissiveFactor[2], 1.0f);
+            vroMat->getEmission().setColor(emissiveColor);
+        }
+    }
+
+    // Process emissive texture if present
+    std::shared_ptr<VROTexture> emissiveTexture = getTexture(gModel, gAdditionalMap, "emissiveTexture", true);
+    if (emissiveTexture != nullptr) {
+        vroMat->getEmission().setTexture(emissiveTexture);
+    }
+
+    // Check for KHR_materials_unlit extension
+    // Unlit materials ignore lighting and use baseColor directly
+    if (gMat.extensions.find("KHR_materials_unlit") != gMat.extensions.end()) {
+        vroMat->setLightingModel(VROLightingModel::Constant);
+    }
+
     vroMat->setName(gMat.name);
     return vroMat;
 }
@@ -1979,11 +2915,13 @@ std::shared_ptr<VROTexture> VROGLTFLoader::getTexture(const tinygltf::Model &gMo
         texture->setWrapT(getWrappingMode(sampler.wrapT));
         texture->setMagnificationFilter(getFilterMode(sampler.magFilter));
         texture->setMinificationFilter(getFilterMode(sampler.minFilter));
+        texture->setMipFilter(getMipFilterMode(sampler.minFilter));
     } else {
         texture->setWrapS(VROWrapMode::Repeat);
         texture->setWrapT(VROWrapMode::Repeat);
         texture->setMagnificationFilter(VROFilterMode::Linear);
         texture->setMinificationFilter(VROFilterMode::Linear);
+        texture->setMipFilter(VROFilterMode::Linear);
     }
 
     // Cache a copy of the created texture as other elements may also refer to it.
@@ -2016,9 +2954,11 @@ VROMatrix4f VROGLTFLoader::getTransformOfNode(const tinygltf::Model &gModel, int
         rot = mat.extractRotation(scale);
     }
 
+    // Compose T * R * S in the correct order (matching glTF spec and buildJointLocalTransform).
+    // scale() then left-multiply by R (R * S), then translate column (T * R * S).
     VROMatrix4f localTransform;
-    localTransform.scale(scale.x, scale.y, scale.z);
-    localTransform.rotate(rot);
-    localTransform.translate(pos);
+    localTransform.scale(scale.x, scale.y, scale.z);     // S
+    localTransform = rot.getMatrix() * localTransform;    // R * S
+    localTransform.translate(pos);                        // T * R * S
     return localTransform;
 }

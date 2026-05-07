@@ -39,7 +39,11 @@
 class VRODriver;
 class VROVideoTextureCacheOpenGL;
 class VROTrackingHelper;
+class VROMonocularDepthEstimator;
 @class VROARKitSessionDelegate;
+@class VROCloudAnchorProviderARCore;
+@class VROCloudAnchorProviderReactVision;
+namespace ReactVisionCCA { class RVCCAGeospatialProvider; }
 
 class API_AVAILABLE(ios(12.0)) VROARSessioniOS : public VROARSession, public std::enable_shared_from_this<VROARSessioniOS> {
 public:
@@ -76,6 +80,7 @@ public:
     void addAnchor(std::shared_ptr<VROARAnchor> anchor);
     void removeAnchor(std::shared_ptr<VROARAnchor> anchor);
     void hostCloudAnchor(std::shared_ptr<VROARAnchor> anchor,
+                         int ttlDays,
                          std::function<void(std::shared_ptr<VROARAnchor>)> onSuccess,
                          std::function<void(std::string error)> onFailure);
     void resolveCloudAnchor(std::string anchorId,
@@ -85,6 +90,8 @@ public:
     std::unique_ptr<VROARFrame> &updateFrame();
     std::unique_ptr<VROARFrame> &getLastFrame();
     std::shared_ptr<VROTexture> getCameraBackgroundTexture();
+    std::shared_ptr<VROTexture> getSemanticTexture() override;
+    std::shared_ptr<VROTexture> getSemanticConfidenceTexture() override;
     
     void setViewport(VROViewport viewport);
     void setOrientation(VROCameraOrientation orientation);
@@ -98,7 +105,110 @@ public:
     }
     void setVideoQuality(VROVideoQuality quality);
     void setVisionModel(std::shared_ptr<VROVisionModel> visionModel);
-    
+
+    // Occlusion support
+    void setOcclusionMode(VROOcclusionMode mode) override;
+    bool isOcclusionSupported() const override;
+    bool isOcclusionModeSupported(VROOcclusionMode mode) const override;
+
+    // Monocular depth estimation (for non-LiDAR devices, or as alternative to LiDAR)
+    void setMonocularDepthEnabled(bool enabled);
+    bool isMonocularDepthEnabled() const;
+    bool isMonocularDepthSupported() const;
+    std::shared_ptr<VROMonocularDepthEstimator> getMonocularDepthEstimator() const;
+
+    /*
+     When true, monocular depth estimation will be used even on devices with LiDAR.
+     This allows using the neural network-based depth on all devices for consistency,
+     testing, or to get depth estimates beyond LiDAR's ~5m range.
+     Default is false (LiDAR is preferred when available).
+     */
+    void setPreferMonocularDepth(bool prefer);
+    bool isPreferMonocularDepth() const;
+
+    /*
+     Set the base URL from which to download the depth model.
+     The full URL will be: baseURL/DepthPro.mlmodelc.zip
+     */
+
+    // Geospatial API
+    void setGeospatialAnchorProvider(VROGeospatialAnchorProvider provider) override;
+    bool isGeospatialModeSupported() const override;
+    void setGeospatialModeEnabled(bool enabled) override;
+    VROEarthTrackingState getEarthTrackingState() const override;
+    VROGeospatialPose getCameraGeospatialPose() const override;
+    void checkVPSAvailability(double latitude, double longitude,
+                              std::function<void(VROVPSAvailability)> callback) override;
+    void createGeospatialAnchor(double latitude, double longitude, double altitude,
+                                VROQuaternion quaternion,
+                                std::function<void(std::shared_ptr<VROGeospatialAnchor>)> onSuccess,
+                                std::function<void(std::string error)> onFailure) override;
+    void resolveGeospatialAnchor(const std::string& platformUuid, VROQuaternion quaternion,
+                                  std::function<void(std::shared_ptr<VROGeospatialAnchor>)> onSuccess,
+                                  std::function<void(std::string error)> onFailure) override;
+    void hostGeospatialAnchor(double latitude, double longitude, double altitude,
+                               const std::string& altitudeMode,
+                               std::function<void(std::string platformUuid)> onSuccess,
+                               std::function<void(std::string error)> onFailure) override;
+    void createTerrainAnchor(double latitude, double longitude, double altitudeAboveTerrain,
+                             VROQuaternion quaternion,
+                             std::function<void(std::shared_ptr<VROGeospatialAnchor>)> onSuccess,
+                             std::function<void(std::string error)> onFailure) override;
+    void createRooftopAnchor(double latitude, double longitude, double altitudeAboveRooftop,
+                             VROQuaternion quaternion,
+                             std::function<void(std::shared_ptr<VROGeospatialAnchor>)> onSuccess,
+                             std::function<void(std::string error)> onFailure) override;
+    void removeGeospatialAnchor(std::shared_ptr<VROGeospatialAnchor> anchor) override;
+    void rvGetGeospatialAnchor(const std::string& anchorId,
+        std::function<void(bool, std::string, std::string)> callback) override;
+    void rvFindNearbyGeospatialAnchors(double lat, double lng, double radius, int limit,
+        std::function<void(bool, std::string, std::string)> callback) override;
+    void rvUpdateGeospatialAnchor(const std::string& anchorId,
+        const std::string& sceneAssetId, const std::string& sceneId, const std::string& name,
+        const std::string& userAssetId,
+        std::function<void(bool, std::string, std::string)> callback) override;
+    void rvUploadAsset(const std::string& filePath, const std::string& assetType,
+        const std::string& fileName, const std::string& appUserId,
+        std::function<void(bool, std::string, std::string, std::string)> callback) override;
+    void rvDeleteGeospatialAnchor(const std::string& anchorId,
+        std::function<void(bool, std::string)> callback) override;
+    void rvListGeospatialAnchors(int limit, int offset,
+        std::function<void(bool, std::string, std::string)> callback) override;
+
+    // Cloud anchor management
+    void rvGetCloudAnchor(const std::string& anchorId,
+        std::function<void(bool, std::string, std::string)> callback) override;
+    void rvListCloudAnchors(int limit, int offset,
+        std::function<void(bool, std::string, std::string)> callback) override;
+    void rvUpdateCloudAnchor(const std::string& anchorId, const std::string& name,
+        const std::string& description, bool isPublic,
+        std::function<void(bool, std::string, std::string)> callback) override;
+    void rvDeleteCloudAnchor(const std::string& anchorId,
+        std::function<void(bool, std::string)> callback) override;
+    void rvFindNearbyCloudAnchors(double lat, double lng, double radius, int limit,
+        std::function<void(bool, std::string, std::string)> callback) override;
+    void rvAttachAssetToCloudAnchor(const std::string& anchorId, const std::string& fileUrl,
+        int64_t fileSize, const std::string& name, const std::string& assetType,
+        const std::string& externalUserId,
+        std::function<void(bool, std::string)> callback) override;
+    void rvRemoveAssetFromCloudAnchor(const std::string& anchorId, const std::string& assetId,
+        std::function<void(bool, std::string)> callback) override;
+    void rvTrackCloudAnchorResolution(const std::string& anchorId, bool success,
+        double confidence, int matchCount, int inlierCount, int processingTimeMs,
+        const std::string& platform, const std::string& externalUserId,
+        std::function<void(bool, std::string)> callback) override;
+    void rvGetProject(const std::string& projectId,
+        std::function<void(bool, std::string, std::string)> callback) override;
+    void rvGetScene(const std::string& sceneId,
+        std::function<void(bool, std::string, std::string)> callback) override;
+    void rvGetSceneAssets(const std::string& sceneId,
+        std::function<void(bool, std::string, std::string)> callback) override;
+
+    // Scene Semantics API
+    bool isSemanticModeSupported() const override;
+    void setSemanticModeEnabled(bool enabled) override;
+    float getSemanticLabelFraction(VROSemanticLabel label) const;
+
     /*
      Internal methods.
      */
@@ -109,6 +219,11 @@ public:
     void addAnchor(ARAnchor *anchor);
     void updateAnchor(ARAnchor *anchor);
     void removeAnchor(ARAnchor *anchor);
+
+    /*
+     Get the native ARSession object for anchor creation.
+     */
+    ARSession *getARSession() const { return _session; }
 
 private:
     
@@ -127,6 +242,43 @@ private:
      Whether or not the session has been paused.
      */
     bool _sessionPaused;
+
+    /*
+     The cloud anchor provider to use for hosting/resolving cloud anchors.
+     */
+    VROCloudAnchorProvider _cloudAnchorProvider = VROCloudAnchorProvider::None;
+
+    /*
+     The ARCore cloud anchor provider instance (for iOS using ARCore SDK).
+     */
+    VROCloudAnchorProviderARCore *_cloudAnchorProviderARCore = nil;
+
+    /*
+     The ReactVision cloud anchor provider instance.
+     Reads RVApiKey and RVProjectId from Info.plist.
+     */
+    VROCloudAnchorProviderReactVision *_cloudAnchorProviderRV = nil;
+
+    /*
+     The ReactVision geospatial provider instance.
+     Active when setGeospatialAnchorProvider(ReactVision) is called.
+     */
+    std::shared_ptr<ReactVisionCCA::RVCCAGeospatialProvider> _geospatialProviderRV;
+    std::string _rvGeoProjectId;
+
+    /*
+     CLLocationManager delegate for ReactVision geospatial — provides GPS pose
+     when ARCore VPS is not in use.
+     */
+    id _rvLocationDelegate;
+
+    /*
+     Last GPS pose received from Core Location (ReactVision provider path).
+     Updated on the main thread; read from any thread via getCameraGeospatialPose().
+     */
+    mutable VROGeospatialPose _lastKnownGPSPose;
+
+    bool _needsGeospatialModeApply = false;
 
     /*
      The last computed ARFrame.
@@ -182,6 +334,14 @@ private:
      Video texture cache used for transferring camera content to OpenGL.
      */
     std::shared_ptr<VROVideoTextureCacheOpenGL> _videoTextureCache;
+
+    /*
+     Fallback 1×1 all-white confidence texture (conf=1.0 everywhere).
+     Returned by getSemanticConfidenceTexture() because the ARCore iOS SDK does not
+     expose a per-pixel confidence image. The result is hard alpha edges (no soft blend)
+     on iOS, identical to the previous discard behaviour.
+     */
+    std::shared_ptr<VROTexture> _defaultConfidenceTexture;
     
     /*
      Update the VROARAnchor with the transforms in the given ARAnchor.
@@ -189,9 +349,19 @@ private:
     void updateAnchorFromNative(std::shared_ptr<VROARAnchor> vAnchor, ARAnchor *anchor);
     
     std::shared_ptr<VROVisionModel> _visionModel;
-    
+
+    /*
+     Monocular depth estimation for non-LiDAR devices (or as alternative to LiDAR).
+     */
+    std::shared_ptr<VROMonocularDepthEstimator> _monocularDepthEstimator;
+    bool _monocularDepthEnabled;
+    bool _preferMonocularDepth;  // When true, use monocular even on LiDAR devices
+    bool _monocularDepthLoading;
+    std::shared_ptr<VRODriver> _driver;
+
     void updateTrackingType(VROTrackingType trackingType);
-    
+    void initializeMonocularDepthEstimator(NSString *modelPath);
+
 };
 
 /*

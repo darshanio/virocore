@@ -39,6 +39,7 @@ class VROTextureReference;
 class VROUniform;
 class VROUniformBinder;
 class VROShaderProgram;
+class VRORenderContext;
 enum class VROEyeType;
 
 /*
@@ -74,6 +75,8 @@ public:
     void bindMaterialUniforms(const VROMaterial &material,
                               std::shared_ptr<VRODriver> &driver);
     void bindGeometryUniforms(float opacity, const VROGeometry &geometry, const VROMaterial &material);
+    void bindOcclusionUniforms(const VRORenderContext &context);
+    void bindCameraUniforms(const VRORenderContext &context);
     
     std::shared_ptr<VROShaderProgram> &getProgram() {
         return _program;
@@ -109,7 +112,9 @@ private:
     VROUniform *_roughnessIntensityUniform;
     VROUniform *_metalnessIntensityUniform;
     VROUniform *_aoUniform;
-    
+    VROUniform *_alphaCutoffUniform;
+    VROUniform *_emissiveColorUniform;
+
     VROUniform *_normalMatrixUniform;
     VROUniform *_modelMatrixUniform;
     VROUniform *_modelViewMatrixUniform;
@@ -119,6 +124,19 @@ private:
     VROUniform *_cameraPositionUniform;
     VROUniform *_eyeTypeUniform;
     std::vector<std::pair<VROUniformBinder *, VROUniform *>> _modifierUniformBinders;
+
+    // AR occlusion uniforms
+    VROUniform *_arCameraPositionUniform;
+    VROUniform *_arViewportSizeUniform;
+    VROUniform *_arDepthTextureTransformUniform;
+    VROUniform *_occlusionZNearUniform;
+    VROUniform *_occlusionZFarUniform;
+
+    // AR semantic uniform (independent of depth occlusion)
+    VROUniform *_arSemanticTextureTransformUniform;
+
+    // Camera texture transform uniform
+    VROUniform *_cameraImageTransformUniform;
     
     /*
      The textures of the material, in order of the samplers in the shader program.

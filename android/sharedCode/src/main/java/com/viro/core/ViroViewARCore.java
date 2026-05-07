@@ -256,6 +256,16 @@ public class ViroViewARCore extends ViroView {
                 return;
             }
 
+            // Detect EGL context recreation after a long background stay (memory pressure).
+            // When this fires for a second time the old EGL context has already been destroyed,
+            // so all GL handles held by the native renderer are stale. Notify the native side
+            // to drop those handles before we reinitialize so we don't crash on the first draw.
+            if (view.mRendererSurfaceInitialized.get()) {
+                Log.i(TAG, "EGL context was lost and recreated — resetting native GL state");
+                view.mNativeRenderer.onSurfaceDestroyed(view.mSurfaceView.getHolder().getSurface());
+                view.mRendererSurfaceInitialized.set(false);
+            }
+
             final int EGL_GL_COLORSPACE_KHR = 0x309D;
             final int EGL_GL_COLORSPACE_SRGB_KHR = 0x3089;
 
@@ -294,9 +304,14 @@ public class ViroViewARCore extends ViroView {
 
         public void onSurfaceChanged(GL10 gl, int width, int height) {
             ViroViewARCore view = mView.get();
-            if (view == null) {
+            if (view == null || view.mSurfaceView == null) {
                 return;
             }
+            
+            if (view.mDestroyed || view.mNativeRenderer == null) {
+                return;
+            }
+            
             view.mNativeRenderer.onSurfaceChanged(view.mSurfaceView.getHolder().getSurface(), width, height);
 
             // Notify ARCore session that the view size changed so that the perspective matrix and
@@ -316,11 +331,25 @@ public class ViroViewARCore extends ViroView {
             if (view == null) {
                 return;
             }
-
-            for (int i = 0; i < view.mFrameListeners.size(); i++) {
-                view.mFrameListeners.get(i).onDrawFrame();
+            
+            // Check if the view has been destroyed or is being destroyed
+            if (view.mDestroyed) {
+                return;
             }
-            view.mNativeRenderer.drawFrame();
+
+            if (view.mFrameListeners != null) {
+                for (int i = 0; i < view.mFrameListeners.size(); i++) {
+                    view.mFrameListeners.get(i).onDrawFrame();
+                }
+            }
+            
+            // Only draw if renderer is valid, initialized, has a scene, and ARCore is installed
+            if (view.mNativeRenderer != null 
+                    && view.mRendererSurfaceInitialized.get() 
+                    && view.mCurrentScene != null
+                    && view.mARCoreInstalled.get()) {
+                view.mNativeRenderer.drawFrame();
+            }
         }
     }
 
@@ -757,6 +786,7 @@ public class ViroViewARCore extends ViroView {
         if (mWeakActivity.get() != activity) {
             return;
         }
+
         // Note that the order matters - GLSurfaceView is paused first so that it does not try
         // to query the session. If Session is paused before GLSurfaceView, GLSurfaceView may
         // still call mSession.update() and get a SessionPausedException.
@@ -777,13 +807,15 @@ public class ViroViewARCore extends ViroView {
             return;
         }
 
-        if (!CameraPermissionHelper.hasCameraPermission(activity) && mRequestedCameraPermissions) {
+        boolean hasCameraPermission = CameraPermissionHelper.hasCameraPermission(activity);
+
+        if (!hasCameraPermission && mRequestedCameraPermissions) {
             notifyRendererFailed(StartupError.CAMERA_PERMISSIONS_NOT_GRANTED, "Error: " +
                     "Attempted to resume an ARCore experience without the required camera permissions!");
             return;
         }
 
-        if (!CameraPermissionHelper.hasCameraPermission(activity)) {
+        if (!hasCameraPermission) {
             CameraPermissionHelper.requestCameraPermission(activity);
             mRequestedCameraPermissions = true;
             return;
@@ -824,7 +856,6 @@ public class ViroViewARCore extends ViroView {
 
 
         mViroTouchGestureListener = null;
-        mPlatformUtil = null;
         mAssetManager = null;
         mSurfaceView = null;
 
@@ -835,13 +866,13 @@ public class ViroViewARCore extends ViroView {
 
         super.dispose();
 
-        // VA: WE call mPlatformUtil.dispose() here instead of before super.dispose, since super.dispose
-        // leads to a crash if the mPlatformUtil renderQueue is null. Proper thing to do is to move this
-        // to end of ViroView.dispose() and ensure that doesn't crash any life cycle crashes. JIRA issue filed is
-        // VIRO-4537.
-
+        // mPlatformUtil.dispose() must come AFTER super.dispose() because super.dispose()
+        // calls mNativeRenderer.destroy() which may dispatch tasks to the render queue.
+        // Setting mRenderQueue=null before that would cause those dispatches to be silently
+        // dropped (VIRO-4537). We null the field after dispose so further calls are no-ops.
         if (mPlatformUtil != null) {
             mPlatformUtil.dispose();
+            mPlatformUtil = null;
         }
     }
 
@@ -1123,6 +1154,26 @@ public class ViroViewARCore extends ViroView {
     }
 
     /**
+     * Enable or disable the semantic segmentation debug overlay on the camera background.
+     * When enabled, each pixel is tinted with the color of its detected semantic label.
+     */
+    public void setSemanticDebugEnabled(boolean enabled) {
+        if (!mDestroyed) {
+            ((RendererARCore) mNativeRenderer).setSemanticDebugEnabled(enabled);
+        }
+    }
+
+    /**
+     * Set the confidence threshold (0.0–1.0) below which semantic labels are discarded
+     * (treated as unlabeled) to reduce boundary noise.
+     */
+    public void setSemanticConfidenceThreshold(float threshold) {
+        if (!mDestroyed) {
+            ((RendererARCore) mNativeRenderer).setSemanticConfidenceThreshold(threshold);
+        }
+    }
+
+    /**
      * Returns true if auto focus is enabled.
      *
      * @return True if auto focus is enabled.
@@ -1132,5 +1183,85 @@ public class ViroViewARCore extends ViroView {
             return ((RendererARCore) mNativeRenderer).isCameraAutoFocusEnabled();
         }
         return false;
+    }
+
+    /**
+     * Listener interface for screenshot capture completion using PixelCopy.
+     */
+    public interface PixelCopyScreenshotListener {
+        /**
+         * Called when the screenshot was successfully captured.
+         *
+         * @param bitmap The captured screenshot bitmap.
+         */
+        void onSuccess(Bitmap bitmap);
+
+        /**
+         * Called when the screenshot capture failed.
+         *
+         * @param errorCode The PixelCopy result code indicating the type of failure.
+         */
+        void onError(int errorCode);
+    }
+
+    /**
+     * Takes a screenshot of the current AR view including the camera background using PixelCopy.
+     * This method captures the actual rendered content of the SurfaceView, ensuring both the
+     * camera feed and 3D objects are included in the screenshot.
+     *
+     * @param listener The listener that will be called with the result.
+     */
+    public void takeScreenshotWithPixelCopy(final PixelCopyScreenshotListener listener) {
+        if (mDestroyed || mSurfaceView == null) {
+            if (listener != null) {
+                listener.onError(android.view.PixelCopy.ERROR_SOURCE_INVALID);
+            }
+            return;
+        }
+
+        final Bitmap bitmap = Bitmap.createBitmap(
+                mSurfaceView.getWidth(),
+                mSurfaceView.getHeight(),
+                Bitmap.Config.ARGB_8888);
+
+        final Handler handler = new Handler(Looper.getMainLooper());
+
+        try {
+            android.view.PixelCopy.request(
+                    mSurfaceView,
+                    bitmap,
+                    new android.view.PixelCopy.OnPixelCopyFinishedListener() {
+                        @Override
+                        public void onPixelCopyFinished(int copyResult) {
+                            if (listener != null) {
+                                if (copyResult == android.view.PixelCopy.SUCCESS) {
+                                    listener.onSuccess(bitmap);
+                                } else {
+                                    bitmap.recycle();
+                                    listener.onError(copyResult);
+                                }
+                            } else {
+                                bitmap.recycle();
+                            }
+                        }
+                    },
+                    handler);
+        } catch (IllegalArgumentException e) {
+            Log.e(TAG, "PixelCopy failed: " + e.getMessage());
+            bitmap.recycle();
+            if (listener != null) {
+                listener.onError(android.view.PixelCopy.ERROR_SOURCE_INVALID);
+            }
+        }
+    }
+
+    /**
+     * Returns the GLSurfaceView used for rendering. This can be used for advanced screenshot
+     * or recording operations.
+     *
+     * @return The GLSurfaceView, or null if the view has been destroyed.
+     */
+    public GLSurfaceView getSurfaceView() {
+        return mSurfaceView;
     }
 }

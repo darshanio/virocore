@@ -21,6 +21,76 @@
 
 namespace arcore {
 
+    struct TerrainAnchorCallbackData {
+        std::function<void(Anchor *anchor)> onSuccess;
+        std::function<void(std::string error)> onFailure;
+        ArSession *session;
+    };
+
+    void terrainAnchorCallback(void *context, ArAnchor *anchor, ArTerrainAnchorState state) {
+        TerrainAnchorCallbackData *data = (TerrainAnchorCallbackData *)context;
+        if (state == AR_TERRAIN_ANCHOR_STATE_SUCCESS) {
+            Anchor *nativeAnchor = new AnchorNative(anchor, data->session);
+            data->onSuccess(nativeAnchor);
+        } else {
+            data->onFailure("Failed to resolve terrain anchor: " + std::to_string(state));
+            if (anchor) ArAnchor_release(anchor);
+        }
+        delete data;
+    }
+
+    struct RooftopAnchorCallbackData {
+        std::function<void(Anchor *anchor)> onSuccess;
+        std::function<void(std::string error)> onFailure;
+        ArSession *session;
+    };
+
+    void rooftopAnchorCallback(void *context, ArAnchor *anchor, ArRooftopAnchorState state) {
+        RooftopAnchorCallbackData *data = (RooftopAnchorCallbackData *)context;
+        if (state == AR_ROOFTOP_ANCHOR_STATE_SUCCESS) {
+            Anchor *nativeAnchor = new AnchorNative(anchor, data->session);
+            data->onSuccess(nativeAnchor);
+        } else {
+            data->onFailure("Failed to resolve rooftop anchor: " + std::to_string(state));
+            if (anchor) ArAnchor_release(anchor);
+        }
+        delete data;
+    }
+
+    struct VpsAvailabilityCallbackData {
+        std::function<void(VPSAvailability)> callback;
+    };
+
+    void vpsAvailabilityCallback(void *context, ArVpsAvailability availability) {
+        VpsAvailabilityCallbackData *data = (VpsAvailabilityCallbackData *)context;
+        VPSAvailability result;
+        switch (availability) {
+            case AR_VPS_AVAILABILITY_AVAILABLE:
+                result = VPSAvailability::Available;
+                break;
+            case AR_VPS_AVAILABILITY_UNAVAILABLE:
+                result = VPSAvailability::Unavailable;
+                break;
+            case AR_VPS_AVAILABILITY_ERROR_NETWORK_CONNECTION:
+                result = VPSAvailability::ErrorNetwork;
+                break;
+            case AR_VPS_AVAILABILITY_ERROR_RESOURCE_EXHAUSTED:
+                result = VPSAvailability::ErrorResourceExhausted;
+                break;
+            case AR_VPS_AVAILABILITY_ERROR_INTERNAL:
+                result = VPSAvailability::ErrorInternal;
+                break;
+            case AR_VPS_AVAILABILITY_UNKNOWN:
+            default:
+                result = VPSAvailability::Unknown;
+                break;
+        }
+        if (data->callback) {
+            data->callback(result);
+        }
+        delete data;
+    }
+
 #pragma mark - Conversion
 
     AnchorAcquireStatus convertAnchorStatus(ArStatus status) {
@@ -262,6 +332,10 @@ namespace arcore {
 
         if (type == AR_TRACKABLE_PLANE) {
             return TrackableType::Plane;
+        } else if (type == AR_TRACKABLE_DEPTH_POINT) {
+            return TrackableType::DepthPoint;
+        } else if (type == AR_TRACKABLE_INSTANT_PLACEMENT_POINT) {
+            return TrackableType::InstantPlacementPoint;
         } else {
             return TrackableType::Point;
         }
@@ -647,6 +721,156 @@ namespace arcore {
         }
     }
 
+    ImageRetrievalStatus FrameNative::acquireDepthImage(Image **outImage) {
+        ArImage *arImage = nullptr;
+        ArStatus status = ArFrame_acquireDepthImage16Bits(_session, _frame, &arImage);
+
+        // Log status for debugging
+        if (status != AR_SUCCESS && status != AR_ERROR_NOT_YET_AVAILABLE) {
+             __android_log_print(ANDROID_LOG_WARN, "ViroARCore",
+                "acquireDepthImage failed: status=%d", (int)status);
+        }
+
+        if (status == AR_ERROR_INVALID_ARGUMENT) {
+            return ImageRetrievalStatus::InvalidArgument;
+        } else if (status == AR_ERROR_DEADLINE_EXCEEDED) {
+            return ImageRetrievalStatus::DeadlineExceeded;
+        } else if (status == AR_ERROR_RESOURCE_EXHAUSTED) {
+            return ImageRetrievalStatus::ResourceExhausted;
+        } else if (status == AR_ERROR_NOT_YET_AVAILABLE) {
+            return ImageRetrievalStatus::NotYetAvailable;
+        } else if (status == AR_SUCCESS && arImage != nullptr) {
+            *outImage = new ImageNative(arImage, _session);
+            return ImageRetrievalStatus::Success;
+        } else {
+            return ImageRetrievalStatus::UnknownError;
+        }
+    }
+
+    ImageRetrievalStatus FrameNative::acquireDepthConfidenceImage(Image **outImage) {
+        ArImage *arImage = nullptr;
+        ArStatus status = ArFrame_acquireRawDepthConfidenceImage(_session, _frame, &arImage);
+
+        if (status == AR_ERROR_INVALID_ARGUMENT) {
+            return ImageRetrievalStatus::InvalidArgument;
+        } else if (status == AR_ERROR_DEADLINE_EXCEEDED) {
+            return ImageRetrievalStatus::DeadlineExceeded;
+        } else if (status == AR_ERROR_RESOURCE_EXHAUSTED) {
+            return ImageRetrievalStatus::ResourceExhausted;
+        } else if (status == AR_ERROR_NOT_YET_AVAILABLE) {
+            return ImageRetrievalStatus::NotYetAvailable;
+        } else if (status == AR_SUCCESS && arImage != nullptr) {
+            *outImage = new ImageNative(arImage, _session);
+            return ImageRetrievalStatus::Success;
+        } else {
+            return ImageRetrievalStatus::UnknownError;
+        }
+    }
+
+    ImageRetrievalStatus FrameNative::acquireSemanticImage(Image **outImage) {
+        // Check if semantic image acquisition is available in the ARCore C API
+        // ArFrame_acquireSemanticImage was added in ARCore 1.40+
+        // #if defined(AR_SEMANTIC_LABEL_SKY)
+        ArImage *arImage = nullptr;
+        ArStatus status = ArFrame_acquireSemanticImage(_session, _frame, &arImage);
+
+        // Log all status values to help debug
+        __android_log_print(ANDROID_LOG_DEBUG, "ViroARCore",
+            "acquireSemanticImage: status=%d (0=SUCCESS, -1=NOT_YET_AVAILABLE)", (int)status);
+
+        if (status == AR_ERROR_INVALID_ARGUMENT) {
+            __android_log_print(ANDROID_LOG_WARN, "ViroARCore", "acquireSemanticImage: AR_ERROR_INVALID_ARGUMENT");
+            return ImageRetrievalStatus::InvalidArgument;
+        } else if (status == AR_ERROR_DEADLINE_EXCEEDED) {
+            __android_log_print(ANDROID_LOG_WARN, "ViroARCore", "acquireSemanticImage: AR_ERROR_DEADLINE_EXCEEDED");
+            return ImageRetrievalStatus::DeadlineExceeded;
+        } else if (status == AR_ERROR_RESOURCE_EXHAUSTED) {
+            __android_log_print(ANDROID_LOG_WARN, "ViroARCore", "acquireSemanticImage: AR_ERROR_RESOURCE_EXHAUSTED");
+            return ImageRetrievalStatus::ResourceExhausted;
+        } else if (status == AR_ERROR_NOT_YET_AVAILABLE) {
+            // This is expected during the first few frames after enabling semantic mode
+            return ImageRetrievalStatus::NotYetAvailable;
+        } else if (status == AR_SUCCESS && arImage != nullptr) {
+            int width = 0, height = 0;
+            ArImage_getWidth(_session, arImage, &width);
+            ArImage_getHeight(_session, arImage, &height);
+            __android_log_print(ANDROID_LOG_INFO, "ViroARCore",
+                "acquireSemanticImage: SUCCESS (width=%d, height=%d)", width, height);
+            *outImage = new ImageNative(arImage, _session);
+            return ImageRetrievalStatus::Success;
+        } else {
+            __android_log_print(ANDROID_LOG_WARN, "ViroARCore", "acquireSemanticImage: UnknownError (status=%d)", (int)status);
+            return ImageRetrievalStatus::UnknownError;
+        }
+        // #else
+        // // ARCore version does not support semantic image acquisition
+        // return ImageRetrievalStatus::NotYetAvailable;
+        // #endif
+    }
+
+    ImageRetrievalStatus FrameNative::acquireSemanticConfidenceImage(Image **outImage) {
+        // Check if semantic confidence image acquisition is available in the ARCore C API
+        // #if defined(AR_SEMANTIC_LABEL_SKY)
+        ArImage *arImage = nullptr;
+        ArStatus status = ArFrame_acquireSemanticConfidenceImage(_session, _frame, &arImage);
+
+        if (status == AR_ERROR_INVALID_ARGUMENT) {
+            return ImageRetrievalStatus::InvalidArgument;
+        } else if (status == AR_ERROR_DEADLINE_EXCEEDED) {
+            return ImageRetrievalStatus::DeadlineExceeded;
+        } else if (status == AR_ERROR_RESOURCE_EXHAUSTED) {
+            return ImageRetrievalStatus::ResourceExhausted;
+        } else if (status == AR_ERROR_NOT_YET_AVAILABLE) {
+            return ImageRetrievalStatus::NotYetAvailable;
+        } else if (status == AR_SUCCESS && arImage != nullptr) {
+            *outImage = new ImageNative(arImage, _session);
+            return ImageRetrievalStatus::Success;
+        } else {
+            return ImageRetrievalStatus::UnknownError;
+        }
+        // #else
+        // // ARCore version does not support semantic confidence image acquisition
+        // return ImageRetrievalStatus::NotYetAvailable;
+        // #endif
+    }
+
+    float FrameNative::getSemanticLabelFraction(SemanticLabel label) {
+        // Check if semantic label fraction query is available in the ARCore C API
+        // #if defined(AR_SEMANTIC_LABEL_SKY)
+        float fraction = 0.0f;
+        ArSemanticLabel arLabel = static_cast<ArSemanticLabel>(static_cast<int>(label));
+        ArStatus status = ArFrame_getSemanticLabelFraction(_session, _frame, arLabel, &fraction);
+
+        // Log status for first label to understand what ARCore is returning
+        if (static_cast<int>(label) == 0) {
+            __android_log_print(ANDROID_LOG_DEBUG, "ViroARCore",
+                "getSemanticLabelFraction: status=%d (0=SUCCESS, -1=NOT_YET_AVAILABLE), fraction=%.4f",
+                (int)status, fraction);
+        }
+
+        if (status == AR_SUCCESS) {
+            // Log non-zero fractions for any label
+            if (fraction > 0.0f) {
+                __android_log_print(ANDROID_LOG_INFO, "ViroARCore",
+                    "Semantic label %d has fraction: %.4f", (int)label, fraction);
+            }
+            return fraction;
+        } else if (status == AR_ERROR_NOT_YET_AVAILABLE) {
+            // This is expected during first few frames after enabling semantic mode
+            return 0.0f;
+        } else {
+            // Log unexpected error statuses
+            __android_log_print(ANDROID_LOG_WARN, "ViroARCore",
+                "ArFrame_getSemanticLabelFraction failed for label %d: status=%d",
+                (int)label, (int)status);
+        }
+        return 0.0f;
+        // #else
+        // // ARCore version does not support semantic label fraction query
+        // return 0.0f;
+        // #endif
+    }
+
 #pragma mark - PointCloud
 
     PointCloudNative::~PointCloudNative() {
@@ -739,6 +963,53 @@ namespace arcore {
 
     SessionNative::SessionNative(void *applicationContext, JNIEnv *env) {
         ArSession_create(env, applicationContext, &_session);
+
+        // Select the camera config with the highest CPU image resolution.
+        // The default is typically 640×480 which produces too few SIFT features
+        // for reliable cross-platform cloud anchor matching. Most devices support
+        // 1920×1080 or higher CPU image resolution.
+        ArCameraConfigFilter *filter = nullptr;
+        ArCameraConfigFilter_create(_session, &filter);
+        // Keep defaults: rear camera, 30fps target, any depth sensor usage
+
+        ArCameraConfigList *configList = nullptr;
+        ArCameraConfigList_create(_session, &configList);
+        ArSession_getSupportedCameraConfigsWithFilter(_session, filter, configList);
+
+        int32_t numConfigs = 0;
+        ArCameraConfigList_getSize(_session, configList, &numConfigs);
+
+        int bestIdx = -1;
+        int32_t bestArea = 0;
+        ArCameraConfig *tmpConfig = nullptr;
+        ArCameraConfig_create(_session, &tmpConfig);
+
+        for (int i = 0; i < numConfigs; ++i) {
+            ArCameraConfigList_getItem(_session, configList, i, tmpConfig);
+            int32_t w = 0, h = 0;
+            ArCameraConfig_getImageDimensions(_session, tmpConfig, &w, &h);
+            int32_t area = w * h;
+            if (area > bestArea) {
+                bestArea = area;
+                bestIdx = i;
+            }
+            __android_log_print(ANDROID_LOG_INFO, "ViroARCore",
+                "Camera config %d: CPU image %dx%d", i, w, h);
+        }
+
+        if (bestIdx >= 0) {
+            ArCameraConfigList_getItem(_session, configList, bestIdx, tmpConfig);
+            int32_t w = 0, h = 0;
+            ArCameraConfig_getImageDimensions(_session, tmpConfig, &w, &h);
+            ArStatus status = ArSession_setCameraConfig(_session, tmpConfig);
+            __android_log_print(ANDROID_LOG_INFO, "ViroARCore",
+                "Selected camera config %d: CPU image %dx%d (status=%d)",
+                bestIdx, w, h, (int)status);
+        }
+
+        ArCameraConfig_destroy(tmpConfig);
+        ArCameraConfigList_destroy(configList);
+        ArCameraConfigFilter_destroy(filter);
     }
 
     SessionNative::~SessionNative() {
@@ -780,7 +1051,8 @@ namespace arcore {
 
     Config *
     SessionNative::createConfig(LightingMode lightingMode, PlaneFindingMode planeFindingMode,
-                                UpdateMode updateMode, CloudAnchorMode cloudAnchorMode, FocusMode focusMode) {
+                                UpdateMode updateMode, CloudAnchorMode cloudAnchorMode, FocusMode focusMode,
+                                DepthMode depthMode, SemanticMode semanticMode, GeospatialMode geospatialMode) {
         ArConfig *config;
         ArConfig_create(_session, &config);
 
@@ -789,10 +1061,17 @@ namespace arcore {
         switch (lightingMode) {
             case LightingMode::Disabled: {
                 arLightingMode = AR_LIGHT_ESTIMATION_MODE_DISABLED;
+                __android_log_print(ANDROID_LOG_INFO, "ViroARCore", "Setting ARCore lighting mode: DISABLED");
                 break;
             }
             case LightingMode::AmbientIntensity: {
                 arLightingMode = AR_LIGHT_ESTIMATION_MODE_AMBIENT_INTENSITY;
+                __android_log_print(ANDROID_LOG_INFO, "ViroARCore", "Setting ARCore lighting mode: AMBIENT_INTENSITY");
+                break;
+            }
+            case LightingMode::EnvironmentalHDR: {
+                arLightingMode = AR_LIGHT_ESTIMATION_MODE_ENVIRONMENTAL_HDR;
+                __android_log_print(ANDROID_LOG_INFO, "ViroARCore", "Setting ARCore lighting mode: ENVIRONMENTAL_HDR");
                 break;
             }
         }
@@ -803,18 +1082,23 @@ namespace arcore {
         switch (planeFindingMode) {
             case PlaneFindingMode::Disabled:
                 arPlaneFindingMode = AR_PLANE_FINDING_MODE_DISABLED;
+                __android_log_print(ANDROID_LOG_INFO, "ViroARCore", "Setting ARCore plane mode: DISABLED");
                 break;
             case PlaneFindingMode::Horizontal:
                 arPlaneFindingMode = AR_PLANE_FINDING_MODE_HORIZONTAL;
+                __android_log_print(ANDROID_LOG_INFO, "ViroARCore", "Setting ARCore plane mode: HORIZONTAL");
                 break;
             case PlaneFindingMode::HorizontalAndVertical:
                 arPlaneFindingMode = AR_PLANE_FINDING_MODE_HORIZONTAL_AND_VERTICAL;
+                __android_log_print(ANDROID_LOG_INFO, "ViroARCore", "Setting ARCore plane mode: HORIZONTAL_AND_VERTICAL");
                 break;
             case PlaneFindingMode::Vertical:
                 arPlaneFindingMode = AR_PLANE_FINDING_MODE_VERTICAL;
+                __android_log_print(ANDROID_LOG_INFO, "ViroARCore", "Setting ARCore plane mode: VERTICAL");
                 break;
         }
         ArConfig_setPlaneFindingMode(_session, config, arPlaneFindingMode);
+        __android_log_print(ANDROID_LOG_INFO, "ViroARCore", "ArConfig_setPlaneFindingMode called with mode: %d", arPlaneFindingMode);
 
         // Set update mode
         ArUpdateMode arUpdateMode;
@@ -853,7 +1137,253 @@ namespace arcore {
                 break;
         }
         ArConfig_setFocusMode(_session, config, arFocusMode);
+
+        // Set depth mode (ARCore 1.8+)
+        ArDepthMode arDepthMode;
+        switch (depthMode) {
+            case DepthMode::Disabled:
+                arDepthMode = AR_DEPTH_MODE_DISABLED;
+                __android_log_print(ANDROID_LOG_INFO, "ViroARCore", "Setting ARCore depth mode: DISABLED");
+                break;
+            case DepthMode::Automatic:
+                arDepthMode = AR_DEPTH_MODE_AUTOMATIC;
+                __android_log_print(ANDROID_LOG_INFO, "ViroARCore", "Setting ARCore depth mode: AUTOMATIC");
+                break;
+            case DepthMode::RawDepthOnly:
+                arDepthMode = AR_DEPTH_MODE_RAW_DEPTH_ONLY;
+                __android_log_print(ANDROID_LOG_INFO, "ViroARCore", "Setting ARCore depth mode: RAW_DEPTH_ONLY");
+                break;
+        }
+        ArConfig_setDepthMode(_session, config, arDepthMode);
+
+        // Set semantic mode (ARCore 1.20+)
+        ArSemanticMode arSemanticMode;
+        switch (semanticMode) {
+            case SemanticMode::Disabled:
+                arSemanticMode = AR_SEMANTIC_MODE_DISABLED;
+                __android_log_print(ANDROID_LOG_INFO, "ViroARCore", "Setting ARCore semantic mode: DISABLED");
+                break;
+            case SemanticMode::Enabled:
+                arSemanticMode = AR_SEMANTIC_MODE_ENABLED;
+                __android_log_print(ANDROID_LOG_INFO, "ViroARCore", "Setting ARCore semantic mode: ENABLED");
+                break;
+        }
+        ArConfig_setSemanticMode(_session, config, arSemanticMode);
+
+        // Set geospatial mode (ARCore 1.31+)
+        ArGeospatialMode arGeospatialMode;
+        switch (geospatialMode) {
+            case GeospatialMode::Disabled:
+                arGeospatialMode = AR_GEOSPATIAL_MODE_DISABLED;
+                __android_log_print(ANDROID_LOG_INFO, "ViroARCore", "Setting ARCore geospatial mode: DISABLED");
+                break;
+            case GeospatialMode::Enabled:
+                arGeospatialMode = AR_GEOSPATIAL_MODE_ENABLED;
+                __android_log_print(ANDROID_LOG_INFO, "ViroARCore", "Setting ARCore geospatial mode: ENABLED");
+                break;
+        }
+        ArConfig_setGeospatialMode(_session, config, arGeospatialMode);
+
         return new ConfigNative(config);
+    }
+
+    bool SessionNative::isDepthModeSupported(DepthMode depthMode) {
+        ArDepthMode arDepthMode;
+        switch (depthMode) {
+            case DepthMode::Disabled:
+                return true;  // Always supported
+            case DepthMode::Automatic:
+                arDepthMode = AR_DEPTH_MODE_AUTOMATIC;
+                break;
+            case DepthMode::RawDepthOnly:
+                arDepthMode = AR_DEPTH_MODE_RAW_DEPTH_ONLY;
+                break;
+        }
+
+        int32_t isSupported = 0;
+        ArSession_isDepthModeSupported(_session, arDepthMode, &isSupported);
+
+        __android_log_print(ANDROID_LOG_INFO, "ViroARCore",
+                          "Depth mode %d supported: %s",
+                          (int)depthMode,
+                          isSupported ? "YES" : "NO");
+
+        return isSupported != 0;
+    }
+
+    bool SessionNative::isSemanticModeSupported(SemanticMode semanticMode) {
+        ArSemanticMode arSemanticMode;
+        switch (semanticMode) {
+            case SemanticMode::Disabled:
+                return true;  // Always supported
+            case SemanticMode::Enabled:
+                arSemanticMode = AR_SEMANTIC_MODE_ENABLED;
+                break;
+        }
+
+        int32_t isSupported = 0;
+        ArSession_isSemanticModeSupported(_session, arSemanticMode, &isSupported);
+
+        __android_log_print(ANDROID_LOG_INFO, "ViroARCore",
+                          "Semantic mode %d supported: %s",
+                          (int)semanticMode,
+                          isSupported ? "YES" : "NO");
+
+        return isSupported != 0;
+    }
+
+    bool SessionNative::isGeospatialModeSupported(GeospatialMode mode) {
+        int supported = 0;
+        ArGeospatialMode arMode = (mode == GeospatialMode::Enabled) ? AR_GEOSPATIAL_MODE_ENABLED : AR_GEOSPATIAL_MODE_DISABLED;
+        ArSession_isGeospatialModeSupported(_session, arMode, &supported);
+        return supported != 0;
+    }
+
+    TrackingState SessionNative::getEarthTrackingState() {
+        ArEarth *earth = nullptr;
+        ArSession_acquireEarth(_session, &earth);
+        if (earth == nullptr) {
+            return TrackingState::Stopped;
+        }
+
+        ArTrackingState trackingState;
+        ArTrackable_getTrackingState(_session, (ArTrackable *)earth, &trackingState);
+        ArTrackable_release((ArTrackable *)earth);
+
+        switch (trackingState) {
+            case AR_TRACKING_STATE_TRACKING:
+                return TrackingState::Tracking;
+            case AR_TRACKING_STATE_PAUSED:
+                return TrackingState::Paused;
+            case AR_TRACKING_STATE_STOPPED:
+            default:
+                return TrackingState::Stopped;
+        }
+    }
+
+    bool SessionNative::getCameraGeospatialPose(GeospatialPoseData *outPose) {
+        ArEarth *earth = nullptr;
+        ArSession_acquireEarth(_session, &earth);
+        if (earth == nullptr) {
+            return false;
+        }
+
+        ArTrackingState trackingState;
+        ArTrackable_getTrackingState(_session, (ArTrackable *)earth, &trackingState);
+        if (trackingState != AR_TRACKING_STATE_TRACKING) {
+            ArTrackable_release((ArTrackable *)earth);
+            return false;
+        }
+
+        ArGeospatialPose *pose = nullptr;
+        ArGeospatialPose_create(_session, &pose);
+        
+        ArEarth_getCameraGeospatialPose(_session, earth, pose);
+        
+        ArGeospatialPose_getLatitudeLongitude(_session, pose, &outPose->latitude, &outPose->longitude);
+        ArGeospatialPose_getAltitude(_session, pose, &outPose->altitude);
+        ArGeospatialPose_getEastUpSouthQuaternion(_session, pose, outPose->quaternion);
+        ArGeospatialPose_getHeading(_session, pose, &outPose->heading);
+        ArGeospatialPose_getHorizontalAccuracy(_session, pose, &outPose->horizontalAccuracy);
+        ArGeospatialPose_getVerticalAccuracy(_session, pose, &outPose->verticalAccuracy);
+        ArGeospatialPose_getOrientationYawAccuracy(_session, pose, &outPose->orientationYawAccuracy);
+        
+        ArGeospatialPose_destroy(pose);
+        ArTrackable_release((ArTrackable *)earth);
+        return true;
+    }
+
+    Anchor *SessionNative::createGeospatialAnchor(double latitude, double longitude, double altitude, float qx, float qy, float qz, float qw) {
+        ArEarth *earth = nullptr;
+        ArSession_acquireEarth(_session, &earth);
+        if (earth == nullptr) return nullptr;
+
+        ArAnchor *arAnchor = nullptr;
+        float quaternion[4] = {qx, qy, qz, qw};
+        ArStatus status = ArEarth_acquireNewAnchor(_session, earth, latitude, longitude, altitude, quaternion, &arAnchor);
+        ArTrackable_release((ArTrackable *)earth);
+
+        if (status != AR_SUCCESS) return nullptr;
+        return new AnchorNative(arAnchor, _session);
+    }
+
+    void SessionNative::createTerrainAnchor(double latitude, double longitude, double altitude, float qx, float qy, float qz, float qw,
+                                            std::function<void(Anchor *anchor)> onSuccess,
+                                            std::function<void(std::string error)> onFailure) {
+        ArEarth *earth = nullptr;
+        ArSession_acquireEarth(_session, &earth);
+        if (earth == nullptr) {
+            onFailure("Failed to acquire Earth");
+            return;
+        }
+
+        TerrainAnchorCallbackData *data = new TerrainAnchorCallbackData{onSuccess, onFailure, _session};
+        float quaternion[4] = {qx, qy, qz, qw};
+        
+        ArResolveAnchorOnTerrainFuture *future = nullptr;
+        ArStatus status = ArEarth_resolveAnchorOnTerrainAsync(_session, earth, latitude, longitude, altitude, quaternion, data, terrainAnchorCallback, &future);
+        
+        ArTrackable_release((ArTrackable *)earth);
+        
+        if (status != AR_SUCCESS) {
+            delete data;
+            onFailure("Failed to start terrain anchor resolution: " + std::to_string(status));
+        }
+        if (future) {
+            ArFuture_release(ArAsFuture(future));
+        }
+    }
+
+    void SessionNative::createRooftopAnchor(double latitude, double longitude, double altitude, float qx, float qy, float qz, float qw,
+                                            std::function<void(Anchor *anchor)> onSuccess,
+                                            std::function<void(std::string error)> onFailure) {
+        ArEarth *earth = nullptr;
+        ArSession_acquireEarth(_session, &earth);
+        if (earth == nullptr) {
+            onFailure("Failed to acquire Earth");
+            return;
+        }
+
+        RooftopAnchorCallbackData *data = new RooftopAnchorCallbackData{onSuccess, onFailure, _session};
+        float quaternion[4] = {qx, qy, qz, qw};
+        
+        ArResolveAnchorOnRooftopFuture *future = nullptr;
+        ArStatus status = ArEarth_resolveAnchorOnRooftopAsync(_session, earth, latitude, longitude, altitude, quaternion, data, rooftopAnchorCallback, &future);
+        
+        ArTrackable_release((ArTrackable *)earth);
+        
+        if (status != AR_SUCCESS) {
+            delete data;
+            onFailure("Failed to start rooftop anchor resolution: " + std::to_string(status));
+        }
+        if (future) {
+            ArFuture_release(ArAsFuture(future));
+        }
+    }
+
+    void SessionNative::checkVpsAvailability(double latitude, double longitude,
+                                             std::function<void(VPSAvailability)> callback) {
+        if (!_session) {
+            if (callback) {
+                callback(VPSAvailability::Unknown);
+            }
+            return;
+        }
+
+        VpsAvailabilityCallbackData *data = new VpsAvailabilityCallbackData{callback};
+        ArVpsAvailabilityFuture *future = nullptr;
+        ArStatus status = ArSession_checkVpsAvailabilityAsync(_session, latitude, longitude, data, vpsAvailabilityCallback, &future);
+
+        if (status != AR_SUCCESS) {
+            delete data;
+            __android_log_print(ANDROID_LOG_WARN, "ViroARCore", "Failed to check VPS availability: %d", status);
+            if (callback) {
+                callback(VPSAvailability::Unknown);
+            }
+        }
+        if (future) {
+            ArFuture_release(ArAsFuture(future));
+        }
     }
 
     AugmentedImageDatabase *SessionNative::createAugmentedImageDatabase() {
@@ -938,6 +1468,19 @@ namespace arcore {
         ArAnchor *cloudAnchor;
         ArStatus status = ArSession_hostAndAcquireNewCloudAnchor(_session, ((AnchorNative *) anchor)->_anchor,
                                                                  &cloudAnchor);
+        if (status == AR_SUCCESS) {
+            *status_v = AnchorAcquireStatus::Success;
+            return new AnchorNative(cloudAnchor, _session);
+        } else {
+            *status_v = convertAnchorStatus(status);
+            return nullptr;
+        };
+    }
+
+    Anchor *SessionNative::hostAndAcquireNewCloudAnchorWithTtl(const Anchor *anchor, int ttlDays, AnchorAcquireStatus *status_v) {
+        ArAnchor *cloudAnchor;
+        ArStatus status = ArSession_hostAndAcquireNewCloudAnchorWithTtl(_session, ((AnchorNative *) anchor)->_anchor,
+                                                                         ttlDays, &cloudAnchor);
         if (status == AR_SUCCESS) {
             *status_v = AnchorAcquireStatus::Success;
             return new AnchorNative(cloudAnchor, _session);
